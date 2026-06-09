@@ -64,56 +64,6 @@ pub fn all_rewrites<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
     rules
 }
 
-// ── HBM cost function for extraction ─────────────────────────────────────────
-
-/// Cost = HBM bytes written by this node (child costs summed by Extractor).
-/// We return HBM bytes from the rl-ir accountant logic.
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
-pub struct HbmCost(pub f64);
-
-impl std::ops::Add for HbmCost {
-    type Output = HbmCost;
-    fn add(self, other: HbmCost) -> HbmCost { HbmCost(self.0 + other.0) }
-}
-
-impl std::ops::Mul<f64> for HbmCost {
-    type Output = HbmCost;
-    fn mul(self, rhs: f64) -> HbmCost { HbmCost(self.0 * rhs) }
-}
-
-impl From<f64> for HbmCost {
-    fn from(v: f64) -> Self { HbmCost(v) }
-}
-
-impl Into<f64> for HbmCost {
-    fn into(self) -> f64 { self.0 }
-}
-
-impl std::fmt::Display for HbmCost {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:.1}", self.0)
-    }
-}
-
-/// Cost function: node cost is HBM bytes. Child costs are added by the
-/// extractor framework.
-#[derive(Clone, Debug, Default)]
-pub struct HbmCostFn;
-
-impl CostFunction<TensorLang> for HbmCostFn {
-    type Cost = HbmCost;
-
-    fn cost<C>(&mut self, enode: &TensorLang, mut get_cost: C) -> HbmCost
-    where
-        C: FnMut(Id) -> Self::Cost,
-    {
-        // Node cost = 1 (to keep extraction monotonic). In M3 this becomes
-        // HBM bytes from the accountant once we pass shape info.
-        let child_cost: f64 = enode.children().iter().map(|&id| get_cost(id).0).sum();
-        HbmCost(1.0 + child_cost)
-    }
-}
-
 // ── Saturation ───────────────────────────────────────────────────────────────
 
 pub fn saturate(expr: &RecExpr<TensorLang>) -> Runner<TensorLang, ()> {
@@ -125,15 +75,175 @@ pub fn saturate(expr: &RecExpr<TensorLang>) -> Runner<TensorLang, ()> {
         .run(&rules)
 }
 
-/// Extract the lowest-cost term using HBM cost.
-pub fn extract_cheapest(
-    runner: &Runner<TensorLang, ()>,
+// ── Cost-driven extraction over a shaped e-graph ─────────────────────────────
+//
+// This is a custom extractor, NOT egg's tree `Extractor` (which double-counts
+// shared tensors — the Tensat wall, CLAUDE.md rule 6). It is a greedy bottom-up
+// selection driven by the `rl-cost` `CostModel`, reading per-e-class shapes from
+// `ShapeAnalysis` to compute real flops and bytes. The `fuse` node is costed by
+// its subtree's fused account (internal intermediates not charged to HBM), so a
+// model that includes `HbmBytes` prefers fusion and a FLOPs-only model does not.
+//
+// Greedy selection is not guaranteed globally optimal (exact min-cost DAG
+// extraction is NP-hard and is what `LpExtractor`/ILP would solve, but its
+// `coin_cbc` solver is unavailable here). It is DAG-honest in that the fused
+// account counts each boundary tensor once; the final reported cost comes from
+// the fuse-aware accountant on the built program.
+
+fn eclass_shape(egraph: &EGraph<TensorLang, ShapeAnalysis>, id: Id) -> Vec<usize> {
+    egraph[id].data.clone().unwrap_or_default()
+}
+
+fn out_bytes(egraph: &EGraph<TensorLang, ShapeAnalysis>, id: Id) -> u64 {
+    (eclass_shape(egraph, id).iter().product::<usize>() * 4) as u64
+}
+
+/// Local flops of one enode, from its children's shapes.
+fn node_flops(egraph: &EGraph<TensorLang, ShapeAnalysis>, enode: &TensorLang) -> u64 {
+    let sh = |id: &Id| eclass_shape(egraph, *id);
+    match enode {
+        TensorLang::MatMul([a, b]) => {
+            let (sa, sb) = (sh(a), sh(b));
+            if sa.len() == 2 && sb.len() == 2 { 2 * sa[0] as u64 * sa[1] as u64 * sb[1] as u64 } else { 0 }
+        }
+        TensorLang::EMul([a, b]) => {
+            let (sa, sb) = (sh(a), sh(b));
+            let out = if sa.iter().product::<usize>() <= 1 { sb } else { sa };
+            out.iter().product::<usize>() as u64
+        }
+        TensorLang::Softmax([a]) => 4 * sh(a).iter().product::<usize>() as u64,
+        _ => 0,
+    }
+}
+
+/// Cost-model-driven extraction over a shaped e-graph.
+///
+/// Two stages, because the `fuse` node is value-equivalent to its child and so
+/// shares its e-class (extracting it directly would be a self-cycle):
+///   1. extract the best *materialized* plan, skipping fuse nodes, with a
+///      recursive cycle guard (a class on the current path costs infinity, so the
+///      result is always a finite tree);
+///   2. let the cost model decide whether to wrap that plan in `fuse`, by
+///      accounting the materialized plan vs the fused one and taking the cheaper.
+///
+/// Stage 2 is where the A/B lives: a FLOPs-only model sees no benefit to fusion
+/// (same flops, one extra node) and keeps the materialized plan; adding HbmBytes
+/// makes the fused plan cheaper. Selection is greedy (exact min-cost DAG
+/// extraction is NP-hard — `LpExtractor`/ILP territory), but every cost is real
+/// bytes from the shape analysis and the fuse decision uses the fuse-aware
+/// accountant directly.
+pub fn extract_cost_driven(
+    egraph: &EGraph<TensorLang, ShapeAnalysis>,
     root: Id,
-) -> (RecExpr<TensorLang>, f64) {
-    let cost_fn = HbmCostFn;
-    let extractor = Extractor::new(&runner.egraph, cost_fn);
-    let (best_cost, best_expr) = extractor.find_best(root);
-    (best_expr, best_cost.0)
+    model: &CostModel,
+) -> RecExpr<TensorLang> {
+    use std::collections::{HashMap, HashSet};
+    let mut sel: HashMap<Id, (f64, usize, usize)> = HashMap::new();
+    let mut visiting: HashSet<Id> = HashSet::new();
+    select_class(egraph, egraph.find(root), model, &mut sel, &mut visiting);
+
+    // Stage 1: the best materialized plan.
+    let mut materialized = RecExpr::default();
+    build_chosen(egraph, egraph.find(root), &sel, &mut materialized);
+
+    // Stage 2: would fusing the whole plan be cheaper under this model?
+    let shapes = shapes_from_egraph(egraph);
+    let mat_acc = account_expr(&materialized, &shapes);
+    let mut fused = materialized.clone();
+    let root_id = Id::from(fused.as_ref().len() - 1);
+    fused.add(TensorLang::Fuse([root_id]));
+    let fused_acc = account_expr(&fused, &shapes);
+
+    let mat_t = model.cost(mat_acc.flops, mat_acc.hbm_bytes).0;
+    let fused_t = model.cost(fused_acc.flops, fused_acc.hbm_bytes).0;
+    // strictly cheaper (beyond float noise) to justify the extra fuse node.
+    if fused_t < mat_t - mat_t.abs() * 1e-9 {
+        fused
+    } else {
+        materialized
+    }
+}
+
+/// Recover input shapes (`Var` name -> shape) from the shaped e-graph, so the
+/// accountant can be run on an extracted program.
+fn shapes_from_egraph(
+    egraph: &EGraph<TensorLang, ShapeAnalysis>,
+) -> std::collections::HashMap<String, Vec<usize>> {
+    let mut m = std::collections::HashMap::new();
+    for class in egraph.classes() {
+        for node in &class.nodes {
+            if let TensorLang::Var(sym) = node {
+                if let Some(shape) = &class.data {
+                    m.insert(sym.to_string(), shape.clone());
+                }
+            }
+        }
+    }
+    m
+}
+
+/// Returns the best acyclic cost of `id`, memoizing (cost, nodes, chosen) into
+/// `sel`. Ties on cost break toward fewer nodes, so a model that cannot see HBM
+/// has no reason to add the extra `fuse` node.
+fn select_class(
+    egraph: &EGraph<TensorLang, ShapeAnalysis>,
+    id: Id,
+    model: &CostModel,
+    sel: &mut std::collections::HashMap<Id, (f64, usize, usize)>,
+    visiting: &mut std::collections::HashSet<Id>,
+) -> f64 {
+    let id = egraph.find(id);
+    if let Some(&(c, _, _)) = sel.get(&id) {
+        return c;
+    }
+    if visiting.contains(&id) {
+        return f64::INFINITY; // a class on the current path: choosing it would cycle
+    }
+    visiting.insert(id);
+
+    let time = |flops: u64, bytes: u64| model.cost(flops, bytes).0;
+    let mut best = (f64::INFINITY, usize::MAX, 0usize);
+    for (ni, enode) in egraph[id].nodes.iter().enumerate() {
+        // Fuse nodes are skipped here: fusion is a value-identity wrapper decided
+        // in stage 2 of `extract_cost_driven`, not a node to extract directly
+        // (it shares its child's e-class, which would self-cycle).
+        let (cost, nodes) = if matches!(enode, TensorLang::Fuse(_)) {
+            (f64::INFINITY, usize::MAX)
+        } else {
+            let mut sum = time(node_flops(egraph, enode), out_bytes(egraph, id));
+            let mut n = 1usize;
+            let mut cyclic = false;
+            for c in enode.children() {
+                let cc = select_class(egraph, *c, model, sel, visiting);
+                if cc.is_infinite() { cyclic = true; break; }
+                sum += cc;
+                n += sel[&egraph.find(*c)].1;
+            }
+            if cyclic { (f64::INFINITY, usize::MAX) } else { (sum, n) }
+        };
+        let tie = (cost - best.0).abs() <= best.0.abs() * 1e-9;
+        if cost < best.0 - best.0.abs() * 1e-9 || (tie && nodes < best.1) {
+            best = (cost, nodes, ni);
+        }
+    }
+
+    visiting.remove(&id);
+    sel.insert(id, best);
+    best.0
+}
+
+/// Build a `RecExpr` from the selected node per e-class.
+fn build_chosen(
+    egraph: &EGraph<TensorLang, ShapeAnalysis>,
+    id: Id,
+    sel: &std::collections::HashMap<Id, (f64, usize, usize)>,
+    out: &mut RecExpr<TensorLang>,
+) -> Id {
+    let id = egraph.find(id);
+    let ni = sel[&id].2;
+    let enode = egraph[id].nodes[ni].clone();
+    let mapped = enode.map_children(|c| build_chosen(egraph, c, sel, out));
+    out.add(mapped)
 }
 
 /// Run the rl-ir accountant over an extracted expression.
@@ -314,29 +424,36 @@ mod tests {
         );
     }
 
+    fn contains_fuse(expr: &RecExpr<TensorLang>) -> bool {
+        expr.as_ref().iter().any(|n| matches!(n, TensorLang::Fuse(_)))
+    }
+
     #[test]
-    fn equivalent_programs_differ_by_scale_distrib() {
-        let (expr, root) = naive_attention_program();
-        let runner = saturate(&expr);
-        let shapes = attn_shapes(32, 16);
-        let naive_acc = account_expr(&expr, &shapes);
+    fn extractor_flips_with_hbm_constraint() {
+        // The A/B at the EXTRACTOR level (not just ranking two hand-built plans):
+        // run the custom cost-driven extractor over the whole saturated e-graph.
+        // FLOPs-only keeps an unfused plan; adding HbmBytes makes it fuse.
+        use rl_cost::{CostModel, FlopsConstraint, HbmConstraint, H100};
+        let (expr, _) = naive_attention_program();
+        let shapes = attn_shapes(2048, 64);
+        let runner = saturate_shaped(&expr, shapes.clone());
+        let root = runner.egraph.lookup_expr(&expr).expect("root in egraph");
 
-        let (best, _cost) = extract_cheapest(&runner, root);
-        let best_acc = account_expr(&best, &shapes);
+        let flops_only = CostModel::new().add(FlopsConstraint::new(H100));
+        let with_hbm = CostModel::new()
+            .add(FlopsConstraint::new(H100))
+            .add(HbmConstraint::new(H100));
 
-        // FLOPs can differ because scale-distrib moves EMul from scores_ss
-        // (1024 FLOPs) to Q_sd (512 FLOPs). The programs are algebraically
-        // equivalent but have different cost profiles — this is the point.
-        let diff = if naive_acc.flops > best_acc.flops {
-            naive_acc.flops - best_acc.flops
-        } else {
-            best_acc.flops - naive_acc.flops
-        };
-        assert!(
-            diff < 1024, // at most one EMul node difference
-            "FLOPs diff {} too large between equivalent programs (naive={}, best={})",
-            diff, naive_acc.flops, best_acc.flops
-        );
+        let plan_flops = extract_cost_driven(&runner.egraph, root, &flops_only);
+        let plan_hbm = extract_cost_driven(&runner.egraph, root, &with_hbm);
+
+        assert!(!contains_fuse(&plan_flops), "FLOPs-only plan should not fuse");
+        assert!(contains_fuse(&plan_hbm), "HBM-aware plan should fuse");
+
+        // And the fused plan really moves fewer bytes.
+        let h_flops = account_expr(&plan_flops, &shapes).hbm_bytes;
+        let h_hbm = account_expr(&plan_hbm, &shapes).hbm_bytes;
+        assert!(h_hbm < h_flops, "fused plan {h_hbm} should move fewer bytes than {h_flops}");
     }
 
     #[test]
@@ -409,19 +526,24 @@ mod tests {
     }
 
     #[test]
-    fn hbm_optimized_is_not_worse_than_naive() {
-        let (expr, root) = naive_attention_program();
+    fn extracted_plan_never_worse_than_naive_on_hbm() {
+        // Whatever the HBM-aware extractor returns must not move more bytes than the
+        // naive program it started from.
+        use rl_cost::{CostModel, FlopsConstraint, HbmConstraint, H100};
+        let (expr, _) = naive_attention_program();
         let shapes = attn_shapes(64, 32);
-        let naive_acc = account_expr(&expr, &shapes);
+        let naive_hbm = account_expr(&expr, &shapes).hbm_bytes;
 
-        let runner = saturate(&expr);
-        let (hbm_best, _) = extract_cheapest(&runner, root);
-        let hbm_acc = account_expr(&hbm_best, &shapes);
+        let runner = saturate_shaped(&expr, shapes.clone());
+        let root = runner.egraph.lookup_expr(&expr).expect("root in egraph");
+        let model = CostModel::new()
+            .add(FlopsConstraint::new(H100))
+            .add(HbmConstraint::new(H100));
+        let plan = extract_cost_driven(&runner.egraph, root, &model);
 
         assert!(
-            hbm_acc.hbm_bytes <= naive_acc.hbm_bytes,
-            "HBM-optimized extraction {hbm} should be <= naive {naive}",
-            hbm = hbm_acc.hbm_bytes, naive = naive_acc.hbm_bytes
+            account_expr(&plan, &shapes).hbm_bytes <= naive_hbm,
+            "extracted plan should not move more bytes than naive"
         );
     }
 }
