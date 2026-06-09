@@ -28,13 +28,7 @@ project. Fixing the optimizer means adding a constraint, not patching the search
 
 The v0 result that proves it is a single A/B test:
 
-```mermaid
-flowchart TD
-    EG["one saturated e-graph<br/>holds naive AND fused attention"]
-    EG -->|"constraints = Flops only"| N["extracts: naive<br/>writes the s×s scores to HBM"]
-    EG -->|"constraints = Flops + HbmBytes"| F["extracts: fused (flash)<br/>s×s never leaves SRAM"]
-    N -.->|"add the constraint you were ignoring"| F
-```
+![the A/B flip: one e-graph, two winners](docs/figures/ab_flip.png)
 
 *the whole thesis in one picture. same search over the same e-graph. model only
 FLOPs and the cheapest plan is naive attention. add the HBM-bandwidth constraint
@@ -48,14 +42,7 @@ model was incomplete.*
 A Cargo workspace. Rust core, a JAX front end planned, Pallas/Triton as the
 emitted backend.
 
-```mermaid
-flowchart LR
-    A["program<br/>(JAX, or built in rl-ir)"] --> B["rl-ir<br/>tensor IR, reference interpreter, HBM accountant"]
-    B --> C["rl-opt<br/>egg e-graph: rewrites add equivalent forms"]
-    C --> D["rl-cost<br/>roofline cost model: slowest resource wins"]
-    D -->|"extract cheapest plan"| E["rl-codegen<br/>Pallas / Triton kernel (stub)"]
-    E --> L["rl-ledger<br/>preregistered, replayable result (stub)"]
-```
+![the pipeline](docs/figures/pipeline.png)
 
 *the pipeline. a program becomes an e-graph of equivalent forms, the cost model
 scores each form by its slowest resource and picks the cheapest, and the chosen
@@ -78,18 +65,7 @@ resource into a lower bound on time. The roofline says the slowest resource wins
 so the predicted time is the max over constraints, and the *binding* resource is
 the one that hit that max.
 
-```
-        time
-         ^
-         |                         . Flops bound (compute)
-         |                      .
-         |  _________________.________   <- a program sits at one point
-         | |  HBM bound      .
-         | |  (bandwidth)  .
-         +-+-------------.------------------>  arithmetic intensity (flop/byte)
-              below ridge | above ridge
-              HBM-bound    | compute-bound
-```
+![the roofline, attention plotted on it](docs/figures/roofline.png)
 
 *the roofline. low arithmetic intensity (few flops per byte moved) means HBM
 bandwidth is the wall; high intensity means compute is. naive attention sits far
@@ -119,17 +95,7 @@ writes the probabilities, reads them back for the output matmul. For long
 sequences that traffic dominates. The `fuse` primitive marks a region as one
 kernel whose intermediates stay in SRAM and never spill.
 
-```mermaid
-flowchart LR
-    subgraph naive["naive: every intermediate hits HBM"]
-        direction LR
-        n1["Q,K,V"] --> n2["scores s×s → HBM"] --> n3["softmax s×s → HBM"] --> n4["out s×d"]
-    end
-    subgraph fused["fused: s×s stays in SRAM"]
-        direction LR
-        f1["Q,K,V"] --> f2["scores · softmax · out<br/>(one kernel, no spill)"] --> f3["out s×d"]
-    end
-```
+![naive vs fused HBM traffic](docs/figures/fusion.png)
 
 *same math, two schedules. the naive plan round-trips the s×s scores and
 probabilities through HBM; the fused plan keeps them in SRAM and only the inputs
