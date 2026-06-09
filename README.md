@@ -226,7 +226,8 @@ it can be replayed.*
 | `rl-cost` | devices, the constraint trait, the slowest-resource cost model | working |
 | `rl-opt` | rewrite rules, the e-graph, shape analysis, cost-driven extraction | working |
 | `rl-codegen` | turns the chosen plan into an executable kernel | working, CPU kernels (attention and MLP) |
-| `rl-ledger` | write-ahead log of preregistered benchmark results, replay | being built now (milestone 5) |
+| `rl-ledger` | write-ahead log of preregistered benchmark results, replay | working |
+| `roofline-cli` | the `roofline` command gluing the ledger to the bench runners | working |
 
 Why Rust for all of it: the hot paths need to be fast, the type system catches
 a lot of nonsense early, and `toydb` proves a complete distributed database
@@ -488,15 +489,31 @@ is done until its numeric criterion is met and written down.
 | M2 | the rewrites generate genuinely different forms | saturated e-graph provably contains them | done |
 | M3 | the A/B flip | flops-only extracts naive, adding HBM extracts fused, same e-graph | done, `the_ab_flip` and `extractor_flips_with_hbm_constraint` pass |
 | M4 | the chosen plan runs and wins for real | matches reference under 1e-5 through s=2048, 1.57x naive at s=2048 | done on CPU, GPU deferred |
-| M5 | the same machinery wins on a second program, and results replay | fused MLP beats the naive path for f greater than d, both headline numbers reproduce via `roofline replay` | in progress |
+| M5 | the same machinery wins on a second program, and results replay | preregistered 1.245x for the fused MLP at f = 8d, both headline claims hold again under `roofline replay` | done on CPU, A100 deferred |
 
-M5 so far: the relu node, the realistic MLP program, the general relu fusion
-rule, the streaming MLP kernel, and the MLP versions of the reachability and
-flip tests are all in and green, 26 tests across the workspace. Still to come:
-the preregistered MLP benchmark and the ledger with replay. The original M5
-target, beating `jax.lax.ragged_dot` on an A100, needs the A100, so like M1
-and M4 the criterion is run honestly on CPU and the GPU half is recorded as
-deferred rather than faked.
+How M5 actually went, in the order the rules demand. A pilot sweep (seed 42)
+showed the fused MLP beating naive at every shape, 1.25x to 1.57x at s=2048
+d=128, so the claim was preregistered with a fresh seed, 43, before the
+measurement that counts: run `mlp-s43-001`, fused MLP at s=2048, d=128,
+f=1024, success defined as speedup at least 1.10 with error under 1e-5. The
+recorded result is 1.245x with error exactly zero (the kernel does the same
+arithmetic in the same order as the reference, so the answers are
+bit-identical). The attention headline was preregistered the same way as
+`attention-s43-002` and recorded 1.209x. Then both were replayed from their
+committed configs: 1.279x and 1.118x, claims hold, errors reproduce exactly.
+The full history is plain JSON in `ledger/wal.jsonl`, and the assess script
+now reads it, so a headline claim failing on some future change blocks the
+push automatically.
+
+The accountant's view of the same run says why fusion wins: the naive MLP
+plan moves 19.9 MB through HBM at that shape, the fused plan 3.1 MB, a 6x
+cut. On this CPU, where compute is the binding resource, that buys a modest
+1.25x. On a bandwidth-starved accelerator the same byte cut is the whole
+game, which is exactly what the cost model predicts and exactly what cannot
+be measured here yet. The original M5 target, beating `jax.lax.ragged_dot`
+on an A100, needs the A100, so like M1 and M4 the criterion was run honestly
+on CPU and the GPU half is recorded as deferred rather than faked. 31 tests
+across the workspace, all green.
 
 ---
 
@@ -557,7 +574,12 @@ cargo test  --workspace                        # numerics gates + unit tests
 
 cargo run -p rl-ir   --example m0_numbers      # true flops and bytes per shape
 cargo run -p rl-cost --example m1_binding      # which resource binds, per shape
-cargo run -p rl-codegen --release --example m4_bench   # naive vs fused, timed
+cargo run -p rl-codegen --release --example m4_bench   # attention, naive vs fused
+cargo run -p rl-codegen --release --example m5_bench   # MLP sweep across f/d
+
+cargo run -p roofline-cli --release -- list              # what the ledger holds
+cargo run -p roofline-cli --release -- replay mlp-s43-001        # re-prove M5
+cargo run -p roofline-cli --release -- replay attention-s43-002  # re-prove M4
 
 python scripts/assess.py                       # the objective score, gates pushes
 python scripts/figures.py                      # regenerate the README figures
@@ -597,11 +619,13 @@ To resume work in a fresh session:
 
 ## 17. what comes next
 
-Finish M5: the preregistered fused MLP benchmark and the ledger, so both
-headline numbers reproduce from one `roofline replay` command. After that, in
-rough order: an SRAM capacity constraint that forces tiling at sizes where the
-fused region cannot fit, real GPU kernel emission once hardware is available,
-calibration of predicted against measured time on that hardware, and further
+All six milestones are done in their CPU-honest form, so what remains is the
+deferred and the next layer. In rough order: an SRAM capacity constraint that
+forces tiling at sizes where the fused region cannot fit, which is the
+project's own rule applied to its own known gap; real GPU kernel emission
+(Pallas or Triton) once hardware is available, plus the A100 runs that M1, M4,
+and M5 each have on hold; calibration of predicted against measured time on
+that hardware; exact ILP extraction when a solver is available; and further
 out, a rewrite proposer that suggests new algebraic identities and only admits
 them after they pass the same numerics and benchmark gates as everything else.
 

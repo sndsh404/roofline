@@ -54,12 +54,14 @@ belongs in `rl-cost` as a new `impl Constraint`, not in `rl-opt`.
 
 ```bash
 cargo build --workspace
-cargo test  --workspace                 # unit + numerics-vs-reference
-cargo bench --bench attention            # the M3 A/B
-cargo bench --bench mlp_ragged           # M5: beat jax.lax.ragged_dot for F>D
-cd py && maturin develop && pytest       # Python/JAX front end + FFI
-roofline replay <run_id>                 # reproduce a recorded result
-roofline prereg --bench <b> --metric <m> --claim "<c>" --seed <n>
+cargo test  --workspace                 # unit + numerics-vs-reference (31 tests)
+cargo run -p rl-codegen --release --example m4_bench   # attention naive vs fused
+cargo run -p rl-codegen --release --example m5_bench   # MLP sweep across f/d
+cargo run -p roofline-cli --release -- list            # ledger contents
+cargo run -p roofline-cli --release -- replay <run_id> # reproduce a recorded result
+cargo run -p roofline-cli --release -- prereg --bench <b> --metric speedup \
+  --claim "<c>" --threshold <t> --seed <n> --param s=2048 --param d=128 ...
+python scripts/assess.py                # objective score; gates pushes
 ```
 
 ## Repo map
@@ -68,13 +70,14 @@ roofline prereg --bench <b> --metric <m> --claim "<c>" --seed <n>
 crates/rl-ir/        # Tensor egg language, shape analysis, reference interpreter
 crates/rl-cost/      # Device, Constraint trait, roofline cost function   <- the core
 crates/rl-opt/       # egg rewrite rules (DESIGN §5) + LpExtractor
-crates/rl-codegen/   # physical plan -> Pallas / Triton emission
-crates/rl-ledger/    # WAL + MVCC run store, preregistration, replay
-py/roofline/         # JAX/Flax tracer, lowering FFI, bench harness
-benches/             # attention.rs, mlp_ragged.rs
+crates/rl-codegen/   # plan -> kernel (CPU fused attention + MLP; Pallas/Triton deferred)
+crates/rl-ledger/    # WAL run store, preregistration, versioned results
+crates/roofline-cli/ # the `roofline` bin: prereg / run / replay / list
+ledger/wal.jsonl     # the committed run ledger (append only)
 references/          # READ-ONLY: risinglight, toydb, type-exercise-in-rust
                      #   (gitignored; study via the Explore subagent, never edit)
 ```
+(planned, not yet real: py/roofline JAX front end, cargo benches)
 
 ## How to work a milestone
 
@@ -94,7 +97,7 @@ plugin's `/recipe-implement` for the mechanical crates.
 - [x] M2  egg + primitive rewrites, e-graph contains equivalent terms with different costs; HBM-aware extraction via LpExtractor deferred to M3
 - [x] M3  THE A/B, DONE: `the_ab_flip` and `extractor_flips_with_hbm_constraint` pass; custom cost-driven extractor (no tree Extractor) selects naive under [Flops], fused under [Flops,HbmBytes], same e-graph; fused form reachable by a general rewrite; assess 100/100. Future polish: exact min-cost DAG extraction (ILP) when coin_cbc is available
 - [x] M4  Lower + verify, DONE (CPU): rl-codegen emits a fused online-softmax attention kernel; `lower()` selects it when the plan has a fuse node; matches reference <1e-5 through s=2048; faster than naive at s>=2048 (1.57x at 2048). Gap recorded: at s=4096 abs err ~1.5e-5 is the f32 REFERENCE accumulation limit (f64 accumulators do not shrink it). GPU Pallas/Triton timing deferred (no accelerator). Bench: `cargo run -p rl-codegen --release --example m4_bench`
-- [ ] M5  MLP beats ragged_dot + ledger, both headline numbers reproducible via `roofline replay`
+- [x] M5  MLP + ledger, DONE (CPU): relu node added (blocks the linear collapse); fused MLP kernel beats the naive reference for f>d, preregistered run `mlp-s43-001` recorded 1.245x at s=2048 d=128 f=1024 (threshold 1.10, err 0.0); ledger WAL + `roofline` CLI live; BOTH headline numbers replayed via `roofline replay` and the claims hold (mlp 1.279x, attention `attention-s43-002` 1.209x recorded / 1.118x replayed); beating `jax.lax.ragged_dot` on an A100 deferred, no accelerator
 
 ## Non-goals for v0 (do not build these)
 

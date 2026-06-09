@@ -132,6 +132,32 @@ class Assessment:
                 self.numbers["m1_attn_binding"] = bindings[0]
                 self.numbers["m1_hbm_bound_rows"] = sum(b == "HbmBytes" for b in bindings)
 
+    def check_ledger(self):
+        """Preregistered claims in the run ledger must hold on their latest
+        result. A failing claim means a headline number regressed or was
+        never met, which is exactly what must block a push."""
+        wal = ROOT / "ledger" / "wal.jsonl"
+        if not wal.exists():
+            return
+        latest = {}
+        for line in wal.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # torn tail is tolerated by the Rust reader too
+            if rec.get("kind") == "result":
+                run = rec["run_id"]
+                if run not in latest or rec["version"] > latest[run]["version"]:
+                    latest[run] = rec
+        for run, rec in sorted(latest.items()):
+            self.numbers[f"ledger_{run}"] = round(rec["metric_value"], 3)
+            if not rec.get("claim_met"):
+                self.deduct("P1", 20, f"ledger: preregistered claim {run} not met "
+                            f"(metric {rec['metric_value']:.3f})")
+
     def check_hard_rules(self):
         """CLAUDE.md hard rules that are greppable."""
         opt = ROOT / "crates" / "rl-opt" / "src"
@@ -260,6 +286,7 @@ def main():
     a.check_build_and_test(run_tests=not args.no_test)
     if not a.auto_fail:
         a.capture_numbers()
+        a.check_ledger()
         a.check_hard_rules()
         a.check_regressions(prev)
         a.check_tracker()
