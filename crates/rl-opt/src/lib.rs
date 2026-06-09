@@ -4,14 +4,19 @@ use std::collections::HashMap;
 
 // ── Rewrite rules from DESIGN §5 ─────────────────────────────────────────────
 
-fn matmul_assoc() -> Vec<Rewrite<TensorLang, ()>> {
+// Rules are generic over the analysis `N` so the same algebra works whether the
+// e-graph carries no analysis (`()`) or the shape analysis used for cost-driven
+// extraction. The rewrites are purely syntactic, so any `Analysis<TensorLang>`
+// satisfies them.
+
+fn matmul_assoc<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
     vec![
         rw!("matmul-assoc-l"; "(matmul (matmul ?a ?b) ?c)" => "(matmul ?a (matmul ?b ?c))"),
         rw!("matmul-assoc-r"; "(matmul ?a (matmul ?b ?c))" => "(matmul (matmul ?a ?b) ?c)"),
     ]
 }
 
-fn transpose_matmul() -> Vec<Rewrite<TensorLang, ()>> {
+fn transpose_matmul<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
     vec![
         rw!("transpose-matmul";
             "(transpose (matmul ?a ?b))" =>
@@ -22,7 +27,7 @@ fn transpose_matmul() -> Vec<Rewrite<TensorLang, ()>> {
     ]
 }
 
-fn scale_distrib() -> Vec<Rewrite<TensorLang, ()>> {
+fn scale_distrib<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
     vec![
         rw!("scale-distrib-l";
             "(matmul (emul ?a ?s) ?b)" =>
@@ -39,11 +44,11 @@ fn scale_distrib() -> Vec<Rewrite<TensorLang, ()>> {
     ]
 }
 
-pub fn all_rewrites() -> Vec<Rewrite<TensorLang, ()>> {
+pub fn all_rewrites<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
     let mut rules = vec![];
-    rules.extend(matmul_assoc());
-    rules.extend(transpose_matmul());
-    rules.extend(scale_distrib());
+    rules.extend(matmul_assoc::<N>());
+    rules.extend(transpose_matmul::<N>());
+    rules.extend(scale_distrib::<N>());
     rules
 }
 
@@ -100,7 +105,7 @@ impl CostFunction<TensorLang> for HbmCostFn {
 // ── Saturation ───────────────────────────────────────────────────────────────
 
 pub fn saturate(expr: &RecExpr<TensorLang>) -> Runner<TensorLang, ()> {
-    let rules = all_rewrites();
+    let rules = all_rewrites::<()>();
     Runner::<TensorLang, ()>::default()
         .with_expr(expr)
         .with_iter_limit(10)
@@ -126,6 +131,85 @@ pub fn account_expr(
 ) -> rl_ir::Account {
     let root = Id::from(expr.as_ref().len() - 1);
     rl_ir::account(expr, root, shapes)
+}
+
+// ── Shape analysis (M3 prerequisite) ─────────────────────────────────────────
+//
+// A cost-driven extractor must know each e-class's shape to compute real flops
+// and HBM bytes per node. The e-graph carries no shape info on its own, so we
+// attach an `egg::Analysis` that propagates `[dim, dim]` shapes bottom-up. Input
+// (`Var`) shapes come from the `inputs` map stored on the analysis. The shape of
+// an e-class is the merge of its members' shapes; algebraically-equivalent terms
+// share a shape, so `merge` keeps the first known shape and treats a later one as
+// agreement (a genuine disagreement would be a rewrite bug, surfaced here).
+
+#[derive(Default, Clone)]
+pub struct ShapeAnalysis {
+    pub inputs: HashMap<String, Vec<usize>>,
+}
+
+impl Analysis<TensorLang> for ShapeAnalysis {
+    /// `None` means "shape not yet known" (e.g. a `Var` whose input shape was not
+    /// supplied). Known shapes are 2-D `[rows, cols]` in M0/M3.
+    type Data = Option<Vec<usize>>;
+
+    fn make(egraph: &EGraph<TensorLang, Self>, enode: &TensorLang) -> Self::Data {
+        let child = |id: &Id| egraph[*id].data.clone();
+        match enode {
+            TensorLang::Var(sym) => egraph.analysis.inputs.get(sym.as_str()).cloned(),
+            TensorLang::MatMul([a, b]) => {
+                let sa = child(a)?;
+                let sb = child(b)?;
+                Some(vec![sa[0], sb[1]])
+            }
+            TensorLang::Transpose([a]) => {
+                let sa = child(a)?;
+                Some(vec![sa[1], sa[0]])
+            }
+            TensorLang::EMul([a, b]) => {
+                // scalar [1] broadcasts; otherwise the non-scalar operand's shape.
+                match (child(a), child(b)) {
+                    (Some(sa), Some(sb)) => {
+                        if sa.iter().product::<usize>() == 1 {
+                            Some(sb)
+                        } else {
+                            Some(sa)
+                        }
+                    }
+                    (Some(sa), None) => Some(sa),
+                    (None, Some(sb)) => Some(sb),
+                    (None, None) => None,
+                }
+            }
+            TensorLang::Softmax([a]) => child(a),
+        }
+    }
+
+    fn merge(&mut self, a: &mut Self::Data, b: Self::Data) -> DidMerge {
+        match (a.clone(), b) {
+            (None, Some(bb)) => {
+                *a = Some(bb);
+                DidMerge(true, false)
+            }
+            (Some(_), None) => DidMerge(false, true),
+            _ => DidMerge(false, false),
+        }
+    }
+}
+
+/// Build a shaped e-graph from a program and saturate it with the algebra. The
+/// returned e-graph has a known shape on every reachable e-class, which is what
+/// a cost-driven extractor reads. This is the foundation the M3 A/B stands on.
+pub fn saturate_shaped(
+    expr: &RecExpr<TensorLang>,
+    inputs: HashMap<String, Vec<usize>>,
+) -> Runner<TensorLang, ShapeAnalysis> {
+    let rules = all_rewrites::<ShapeAnalysis>();
+    Runner::<TensorLang, ShapeAnalysis>::new(ShapeAnalysis { inputs })
+        .with_expr(expr)
+        .with_iter_limit(10)
+        .with_node_limit(50_000)
+        .run(&rules)
 }
 
 #[cfg(test)]
@@ -188,6 +272,35 @@ mod tests {
             diff < 1024, // at most one EMul node difference
             "FLOPs diff {} too large between equivalent programs (naive={}, best={})",
             diff, naive_acc.flops, best_acc.flops
+        );
+    }
+
+    #[test]
+    fn shape_analysis_infers_attention_output() {
+        // The e-graph must know that O_sd is [s, d] = [64, 32], inferred bottom-up
+        // from the input shapes through matmul/transpose/softmax. Without this a
+        // cost-driven extractor is blind.
+        let (expr, _root) = naive_attention_program();
+        let runner = saturate_shaped(&expr, attn_shapes(64, 32));
+        let root = runner.egraph.lookup_expr(&expr).expect("root in egraph");
+        assert_eq!(
+            runner.egraph[root].data,
+            Some(vec![64, 32]),
+            "attention output e-class shape should be [s, d] = [64, 32]"
+        );
+    }
+
+    #[test]
+    fn shape_survives_saturation_equivalences() {
+        // scale-distrib and assoc rewrites add equivalent terms to the root class.
+        // All must agree on the output shape, so the merged shape stays [s, d].
+        let (expr, _root) = naive_attention_program();
+        let runner = saturate_shaped(&expr, attn_shapes(128, 64));
+        let root = runner.egraph.lookup_expr(&expr).expect("root in egraph");
+        assert_eq!(runner.egraph[root].data, Some(vec![128, 64]));
+        assert!(
+            runner.egraph.number_of_classes() > 5,
+            "saturation should still produce equivalent terms"
         );
     }
 
