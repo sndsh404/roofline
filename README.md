@@ -1,167 +1,191 @@
-# Roofline
+# roofline
 
-A cost-based optimizing compiler for tensor programs, built like a query engine.
+A compiler that picks the fastest way to run neural network math, the same way
+a database picks the fastest way to run a query.
 
-Roofline takes a neural-network computation, represents every equivalent way of
-running it in one structure, scores each by the physical resource that would
-actually bottleneck it, and picks the cheapest. It is the same machine a database
-uses to optimize a SQL query, pointed at a tensor program instead.
+You give it a small tensor program, say attention or an MLP layer. It builds
+every mathematically equal way of computing the same answer, asks a cost model
+which one the hardware would actually run fastest, and picks that one. The
+interesting part is not the search. The interesting part is that the cost
+model is built from physical limits of the machine, and when the picker gets
+something wrong, the fix is always to teach the cost model about one more
+physical limit. Never to hack the search.
 
-This README is meant to take you from zero to the full picture. It starts with the
-plain ideas (what a tensor program is, why the same math has many forms, what
-"memory-bound" means), then walks every crate with the real code and the reasons
-behind each decision, then the milestones, the development process, the honest
-limitations, and a glossary. It is long on purpose and it is a living document:
-every milestone updates it.
-
-Companion files: `DESIGN.md` is the formal spec, `WORKFLOW.md` is the development
-process, `CLAUDE.md` is the short operating guide loaded each session.
-
----
-
-## Table of contents
-
-1. [The problem, in plain terms](#1-the-problem-in-plain-terms)
-2. [The one idea, and the rule it forces](#2-the-one-idea-and-the-rule-it-forces)
-3. [The headline result: the A/B flip](#3-the-headline-result-the-ab-flip)
-4. [Architecture: the five crates](#4-architecture-the-five-crates)
-5. [rl-ir: the language, interpreter, and accountant](#5-rl-ir-the-language-interpreter-and-accountant)
-6. [rl-cost: the roofline cost model](#6-rl-cost-the-roofline-cost-model)
-7. [rl-opt: e-graphs, rewrites, shapes, extraction](#7-rl-opt-e-graphs-rewrites-shapes-extraction)
-8. [The fuse primitive: how fusion saves HBM](#8-the-fuse-primitive-how-fusion-saves-hbm)
-9. [The milestones, M0 through M5](#9-the-milestones-m0-through-m5)
-10. [Design decisions and trade-offs](#10-design-decisions-and-trade-offs)
-11. [Honest limitations and prior art](#11-honest-limitations-and-prior-art)
-12. [Build, test, run, resume](#12-build-test-run-resume)
-13. [Glossary](#13-glossary)
-14. [Roadmap](#14-roadmap)
+Companion files: `DESIGN.md` is the formal spec, `WORKFLOW.md` is how the work
+is done across sessions, `CLAUDE.md` is the short operating guide a coding
+session loads first. This README is the long version, written so that someone
+with no background in GPUs or compilers can follow the whole thing. It gets
+updated every milestone.
 
 ---
 
-## 1. The problem, in plain terms
+## contents
 
-### What a tensor program is
+1. [the story this project starts from](#1-the-story-this-project-starts-from)
+2. [the two speeds inside a GPU](#2-the-two-speeds-inside-a-gpu)
+3. [the database idea](#3-the-database-idea)
+4. [the one rule everything follows](#4-the-one-rule-everything-follows)
+5. [the headline result, the A/B flip](#5-the-headline-result-the-ab-flip)
+6. [how the code is laid out](#6-how-the-code-is-laid-out)
+7. [rl-ir, the language and the referee](#7-rl-ir-the-language-and-the-referee)
+8. [rl-cost, the cost model](#8-rl-cost-the-cost-model)
+9. [rl-opt, the e-graph and the extractor](#9-rl-opt-the-e-graph-and-the-extractor)
+10. [fusion, the trick the optimizer has to find](#10-fusion-the-trick-the-optimizer-has-to-find)
+11. [rl-codegen, the kernel that proves it](#11-rl-codegen-the-kernel-that-proves-it)
+12. [the milestones and their numbers](#12-the-milestones-and-their-numbers)
+13. [how the work stays honest](#13-how-the-work-stays-honest)
+14. [what this is not](#14-what-this-is-not)
+15. [build, test, run, resume](#15-build-test-run-resume)
+16. [small glossary](#16-small-glossary)
+17. [what comes next](#17-what-comes-next)
 
-A neural network, at the level that matters here, is arithmetic on big rectangular
-arrays of numbers. An array is a **tensor**. A matrix `[rows, cols]` is a 2-D
-tensor. Attention multiplies matrices, takes a softmax, multiplies again. An MLP
-multiplies by one weight matrix, then another. Strip away the framework and a
-forward pass is a small **graph of operations**: inputs flow in, matmuls and
-elementwise ops transform them, an output flows out.
+---
 
-Throughout this project every tensor name carries its shape as a suffix. `Q_sd` is
-`[seq, dim]`. `scores_ss` is `[seq, seq]`. `O_sd` is the output `[seq, dim]`. If a
-variable's shape is not in its name, the name is considered wrong. This is not
-decoration: it lets you read a cost argument at a glance, because the cost of an
-op is a function of the shapes it touches.
+## 1. the story this project starts from
 
-### Why the same computation has many forms
+In 2022 a group at Stanford published Flash Attention. It computes exactly the
+same attention function every transformer already used, the same inputs, the
+same outputs, down to floating point noise. It even does slightly more
+arithmetic than the standard version. And it runs several times faster.
 
-Here is the key fact that makes optimization possible: **the same mathematical
-result can be computed in many different ways**, and they cost wildly different
-amounts on real hardware. Examples:
+How can the same math, with more arithmetic, be faster? Because the slow part
+was never the arithmetic. The standard way of computing attention builds a
+large intermediate table, the score matrix, writes it out to the GPU's main
+memory, reads it back, writes another table, reads that back too. For a
+sequence of 2048 tokens that table is 2048 by 2048 numbers, 16 MB, and the
+naive plan drags it back and forth several times. Flash Attention organizes
+the work so the table never gets written out at all. It lives briefly in the
+GPU's small fast memory, gets used, and is gone. Fewer bytes moved, much
+faster, same answer.
 
-- `(A · B) · C` equals `A · (B · C)`, same answer, different amount of work
-  depending on the matrix sizes.
-- You can compute the whole `scores = Q · Kᵀ` matrix, store it, then read it back
-  to softmax it, or you can compute it in tiles and never store the whole thing.
-- You can keep an intermediate in fast memory and consume it immediately, or you
-  can write it out to slow memory and read it back later.
+A person had to notice that. Tri Dao and his coauthors understood the hardware
+deeply enough to see that the memory traffic, not the math, was the bill, and
+they redesigned the schedule around it.
 
-All of these are the *same math*. They differ only in **schedule**: the order,
-the tiling, what gets stored where. Choosing the cheapest schedule is the entire
-game.
+The bet of this project: a machine could have found that. Not by being clever,
+but by being told the actual physical constraint, that moving bytes costs
+time, and then searching the space of equal programs for the one with the
+smallest bill. The whole repo is that bet, built small enough for one person
+to finish: a tiny tensor language, a search over equivalent forms, a cost
+model made of physical limits, and a benchmark at the end of every milestone
+so the claims are numbers, not vibes.
 
-### Why "the bottleneck is not the math"
+---
 
-The instinct is to count arithmetic, floating point operations, FLOPs, and
-assume fewer FLOPs means faster. On modern accelerators this is usually wrong. A
-GPU can do hundreds of trillions of FLOPs per second, but moving data between its
-big-but-slow memory (HBM) and its small-but-fast memory (SRAM) is comparatively
-glacial. Many real kernels spend their time **waiting for memory**, not computing.
+## 2. the two speeds inside a GPU
 
-The standard way to see this is the **roofline**. Plot a program's *arithmetic
-intensity*, how many FLOPs it does per byte it moves, against the performance it
-can achieve. Below a certain intensity (the "ridge point") you are limited by
-memory bandwidth; above it you are limited by compute.
+To follow anything else in this README you only need one mental picture.
+
+A GPU has compute units that do arithmetic, and they are absurdly fast. An
+H100 can do about 989 trillion floating point operations per second. Call each
+of those operations a flop.
+
+A GPU also has memory, and here is the catch, it has two kinds. There is a big
+slow memory called HBM, tens of gigabytes, where your model weights and
+activations live. And there is a tiny fast memory called SRAM, a few dozen
+megabytes, right next to the compute units. Data has to be in SRAM to be
+computed on. The pipe between HBM and SRAM moves about 3.35 terabytes per
+second on an H100, which sounds like a lot until you divide: the chip can do
+roughly 295 flops in the time it takes to move a single byte.
+
+So every program has a budget question. How many flops does it do per byte it
+moves? That ratio is called arithmetic intensity. If your program does fewer
+than about 295 flops per byte, the compute units finish early and sit there
+waiting for memory. You are memory-bound. More than that, and memory keeps up
+while the compute units become the limit. You are compute-bound. Plot it and
+you get a line that rises and then goes flat, shaped like a roofline.
 
 ![the roofline, attention plotted on it](docs/figures/roofline.png)
 
-*the roofline. low arithmetic intensity (few flops per byte moved) means HBM
-bandwidth is the wall; high intensity means compute is. naive attention sits far
-to the left at around 9 flops per byte, deep in the bandwidth-bound region, which
-is exactly what fusion attacks by cutting the bytes.*
+*the roofline of an H100. naive attention does about 9 flops per byte moved,
+far left, deep in the memory-bound zone. fusion does not reduce the math, it
+reduces the bytes, which slides the point right along the curve.*
 
-This is why Flash Attention was a breakthrough even though it does *the same
-math* as naive attention and even a few *more* FLOPs: it removes the giant
-`seq×seq` score matrix from the memory traffic. The win was a memory win, found by
-a human who understood the real constraint. The thesis of this project is that a
-machine with the right cost model would have found it automatically.
-
-### The query-optimizer analogy
-
-Databases solved a structurally identical problem decades ago. A SQL query has many
-equivalent execution plans (which table to scan first, which join algorithm, which
-index). A **query optimizer** searches the space of equivalent plans, scores each
-with a **cost model** based on physical costs (disk I/O, CPU, memory), and picks
-the cheapest, then executes it and records the result.
-
-Swap "SQL query" for "tensor program" and "disk I/O" for "HBM bandwidth" and you
-have Roofline. The machinery is the same; only the cost model changes. That reuse
-is the whole bet.
+Naive attention sits at about 9 flops per byte. Nine, against a ridge of 295.
+It spends almost all of its time waiting on memory. That is why removing
+memory traffic, which is all Flash Attention does, is worth several times the
+speed, and why counting flops alone tells you almost nothing about how fast a
+tensor program will run.
 
 ---
 
-## 2. The one idea, and the rule it forces
+## 3. the database idea
 
-Everything in this project serves a single design decision:
+Databases solved this exact shape of problem fifty years ago.
 
-> **The cost model is a pluggable set of physical-constraint lower bounds, and a
-> plan's cost is its slowest resource.**
+A SQL query can be executed in many different orders: which table to scan
+first, which join algorithm to use, which index to consult. All of them return
+the same rows. Their costs differ by factors of thousands. So every serious
+database has a query optimizer: it enumerates equivalent plans, scores each
+one with a cost model built from physical quantities like disk reads and
+memory, and runs the cheapest.
 
-A "constraint" is one physical resource (compute, memory bandwidth, later:
-occupancy, communication, SRAM capacity). Each constraint looks at a plan and says
-"given my resource, this cannot run faster than *t* seconds." The roofline says the
-slowest resource wins, so the plan's predicted time is the **maximum** over all
-constraints, and the constraint that produced that maximum is the **binding**
-resource.
+Now swap the words. A tensor program can be computed in many different orders:
+which matmul to group first, whether to keep an intermediate or recompute it,
+whether to write a table out or consume it on the spot. All of them return the
+same numbers. Their costs differ by large factors, and the dominant physical
+quantity is bytes moved between HBM and SRAM instead of disk reads.
 
-This forces a discipline that is the soul of the project:
-
-> When the optimizer picks a bad plan, the cause is always **"the cost model was
-> missing a constraint,"** never **"the search failed."**
-
-If the optimizer is wrong, you do not patch the search with a special case. You ask
-which physical constraint it failed to model, and you add it, a new
-`impl Constraint`, usually about twenty lines. The failure is named and localized
-by construction. This is what makes the system extensible instead of a pile of
-heuristics, and it is the reason the cost model, not the search, is where the
-intelligence lives.
+Same machinery, different cost model. That reuse is the entire design. This
+repo is a query optimizer pointed at tensor programs, and several pieces of it
+are studied directly from database codebases (`risinglight` for the
+optimizer pattern, `toydb` for the write-ahead log that records results).
 
 ---
 
-## 3. The headline result: the A/B flip
+## 4. the one rule everything follows
 
-The v0 result that proves the thesis is a single experiment. Build one e-graph that
-contains both naive attention and the fused (Flash-like) form. Extract the cheapest
-plan twice, changing only the cost model:
+Everything in the repo serves one design decision:
 
-![the A/B flip: one e-graph, two winners](docs/figures/ab_flip.png)
+> The cost model is a set of pluggable physical constraints, and a plan's
+> predicted time is whichever constraint is slowest.
 
-*the whole thesis in one picture. same search over the same e-graph. model only
-FLOPs and the cheapest plan is naive attention. add the HBM-bandwidth constraint
-and the winner flips to the fused form. the optimizer was never wrong, the cost
-model was incomplete.*
+A constraint is one resource with a hard physical limit. Compute is one: a
+plan that needs N flops cannot finish faster than N divided by the chip's peak
+flops. Memory bandwidth is another: a plan that moves B bytes cannot finish
+faster than B divided by the bandwidth. Each constraint gives a lower bound on
+time, the real time is at least the largest of them, and the constraint that
+produces that largest bound is called the binding resource. The model does not
+just say "1.6 milliseconds", it says "1.6 milliseconds, and memory is the
+reason".
 
-- With `constraints = [Flops]`, the cost model cannot see memory traffic at all, so
-  it has no reason to prefer fusion. It returns naive attention. This is the exact
-  local optimum a FLOPs-only mindset gets stuck in.
-- With `constraints = [Flops, HbmBytes]`, the model now sees that naive attention
-  round-trips a huge `seq×seq` matrix through HBM, and the fused form does not. The
-  fused form wins.
+This forces the discipline the project is really about:
 
-Same search, same e-graph, one extra constraint. That flip *is* the thesis made
-executable, and it now **runs as a passing test**, `the_ab_flip` in `rl-opt`:
+> When the optimizer picks a bad plan, the cause is always a missing
+> constraint in the cost model, never a broken search.
+
+If the picker chooses something slow, you do not patch the search with a
+special case. You ask which physical limit it could not see, write that limit
+as a new constraint, usually about twenty lines, and the picker corrects
+itself. The failure is named and localized by construction. That is what keeps
+the system from rotting into a pile of heuristics.
+
+---
+
+## 5. the headline result, the A/B flip
+
+The result the repo exists for is one controlled experiment, and it now runs
+as a passing test.
+
+Build one e-graph (explained in section 9, for now: one structure holding many
+equal programs) that contains both naive attention and the fused, Flash-like
+form. Ask for the cheapest plan twice. The only difference between the two
+runs is what the cost model can see.
+
+![the A/B flip, one e-graph, two winners](docs/figures/ab_flip.png)
+
+*the whole thesis in one picture. when the cost model can only see flops it
+keeps naive attention, because fusion saves no flops. add the memory
+constraint and the winner flips to the fused form. nothing about the search
+changed.*
+
+With only the flops constraint, the model literally cannot see memory traffic.
+Fusion saves zero flops, so the model has no reason to prefer it, and it keeps
+the naive plan. This is the local optimum a flops-only mindset gets stuck in.
+
+Add the HBM bytes constraint and the model now sees that the naive plan drags
+a 16 MB table through slow memory several times while the fused plan does not.
+The winner flips. Same e-graph, same search code, one extra constraint.
 
 ```rust
 let candidates = [naive, fused];                 // both reachable in one e-graph
@@ -169,549 +193,417 @@ let flops_only = CostModel::new().add(FlopsConstraint::new(H100));
 let with_hbm   = flops_only.clone().add(HbmConstraint::new(H100));
 
 assert_eq!(select_plan(&candidates, &shapes, &flops_only), 0); // keeps naive
-assert_eq!(select_plan(&candidates, &shapes, &with_hbm),    1); // chooses fused
+assert_eq!(select_plan(&candidates, &shapes, &with_hbm),    1); // picks fused
 ```
 
-A companion test, `fused_form_is_reachable_by_rewrite`, proves the fused candidate
-is not hand-built: a general fusion rewrite (`(matmul (softmax ?x) ?v) => (fuse
-…)`) places it in the same e-class as the naive root during saturation. So the form
-is *reached* by the algebra and *selected* by the cost model, the two halves rule
-4 demands. The one piece still open is general DAG extraction over an arbitrary
-e-graph (the cost model currently selects among the reachable candidate plans); see
-§7 and the roadmap.
+Two details keep this honest. First, the fused form is not hand-delivered to
+the picker: a test called `fused_form_is_reachable_by_rewrite` proves a
+general rewrite rule places it in the e-graph during the search, in the same
+equivalence class as the naive program. Second, the flip also happens at the
+extractor level, where the picker walks the whole e-graph rather than ranking
+two named candidates; that is the `extractor_flips_with_hbm_constraint` test.
+As of milestone 5 the same pair of tests exists for the MLP, so the flip is a
+property of the system, not a one-off about attention.
 
 ---
 
-## 4. Architecture: the five crates
+## 6. how the code is laid out
 
-A Cargo workspace. Rust for the core (a complete distributed database like `toydb`
-fits in ~15k lines of Rust, so a one-person optimizer core is realistic), with a
-JAX front end planned and Pallas/Triton as the eventual kernel backend.
+A Rust workspace with five crates, one job each. The arrow of dependency only
+points left: the cost model and the optimizer depend on the language, nothing
+depends on codegen or the ledger.
 
 ![the pipeline](docs/figures/pipeline.png)
 
-*the pipeline. a program becomes an e-graph of equivalent forms, the cost model
-scores each form by its slowest resource and picks the cheapest, and the chosen
-plan is lowered to a kernel and recorded so it reproduces.*
+*a program enters as a term in the tiny tensor language, the optimizer grows
+the e-graph of equal forms, the cost model picks the cheapest, codegen lowers
+the winner to a runnable kernel, and the ledger records the measured result so
+it can be replayed.*
 
-| crate | role | status |
+| crate | job | status |
 |---|---|---|
-| `rl-ir` | the tensor IR (an `egg` language), a naive reference interpreter that *defines* correctness, and the accountant that measures true FLOPs and HBM bytes | working |
-| `rl-cost` | `Device`, the `Constraint` trait, and the roofline cost model, the core idea | working |
-| `rl-opt` | the `egg` e-graph, the rewrite rules, the shape analysis, and extraction | working (extraction is the M3 frontier) |
-| `rl-codegen` | lowering a chosen physical plan to a Pallas/Triton kernel | stub |
-| `rl-ledger` | a write-ahead-log + MVCC store for preregistered, replayable results | stub |
+| `rl-ir` | the tensor language, the reference interpreter that defines correct, and the accountant that counts true flops and bytes | working |
+| `rl-cost` | devices, the constraint trait, the slowest-resource cost model | working |
+| `rl-opt` | rewrite rules, the e-graph, shape analysis, cost-driven extraction | working |
+| `rl-codegen` | turns the chosen plan into an executable kernel | working, CPU kernels (attention and MLP) |
+| `rl-ledger` | write-ahead log of preregistered benchmark results, replay | being built now (milestone 5) |
 
-The dependency direction is strict: `rl-cost` and `rl-opt` depend on `rl-ir`;
-nothing depends on `rl-codegen` or `rl-ledger` yet. The reason the cost model is its
-own crate, separate from the optimizer, is the prime directive: the cost model must
-be independently testable and extensible without touching search code.
+Why Rust for all of it: the hot paths need to be fast, the type system catches
+a lot of nonsense early, and `toydb` proves a complete distributed database
+fits in about 15 thousand lines of Rust, so a one-person optimizer core is a
+reasonable bet. A JAX front end and real GPU kernel output (Pallas or Triton)
+are planned for when an accelerator is available.
+
+One naming rule applies everywhere, in code and prose: every tensor name
+carries its shape. `Q_sd` is the query matrix, sequence by dimension.
+`scores_ss` is sequence by sequence. If the shape is not in the name, the name
+is wrong. It sounds fussy and it pays for itself daily, because every cost
+argument in this project is an argument about shapes.
 
 ---
 
-## 5. rl-ir: the language, interpreter, and accountant
+## 7. rl-ir, the language and the referee
 
-`rl-ir` is the foundation and was built first on purpose. It is the least glamorous
-crate and the most load-bearing: it defines what a program *is*, what *correct*
-means, and what the true resource costs are. Every later claim stands on it.
+This crate was built first and everything else stands on it. It answers three
+questions: what is a program, what does correct mean, and what does a program
+truly cost.
 
-### The IR is an `egg` language
-
-A program is a term in a small language defined with the `egg` library's
-`define_language!` macro. `egg` is an e-graph library (explained fully in §7); the
-important part now is that defining the IR as an `egg` language means the same data
-structure the interpreter walks is the one the optimizer rewrites, no translation
-layer, no drift.
+A program is a term in a deliberately tiny language, seven node types:
 
 ```rust
 define_language! {
     pub enum TensorLang {
-        Var(Symbol),                 // a named input tensor, e.g. Q_sd
+        Var(Symbol),                     // a named input, e.g. Q_sd
         "matmul"    = MatMul([Id; 2]),   // [m,k] x [k,n] -> [m,n]
         "transpose" = Transpose([Id; 1]),// [m,n] -> [n,m]
-        "emul"      = EMul([Id; 2]),     // elementwise multiply; a scalar broadcasts
-        "softmax"   = Softmax([Id; 1]),  // numerically stable softmax over the last axis
-        "fuse"      = Fuse([Id; 1]),     // run as one kernel; intermediates stay in SRAM
+        "emul"      = EMul([Id; 2]),     // elementwise multiply, scalars broadcast
+        "softmax"   = Softmax([Id; 1]),  // stable softmax over the last axis
+        "relu"      = Relu([Id; 1]),     // max(x, 0), the MLP's nonlinearity
+        "fuse"      = Fuse([Id; 1]),     // run the subtree as one kernel
     }
 }
 ```
 
-Each `Id` is a reference to a child node. The set is deliberately tiny, just enough
-to express naive attention and a two-layer MLP. That is a trade-off: a small
-language is easy to reason about and easy to give a correct interpreter, at the cost
-of not expressing arbitrary programs yet. v0 does not need generality; it needs one
-honest end-to-end result.
+That is enough to write the two programs the project cares about. Attention is
+`softmax((Q_sd x K_sd transposed) x scale) x V_sd`. The MLP is
+`relu(X_sd x W_up_df) x W_dn_fd`, the up projection into a hidden width f,
+a relu, and the down projection back to width d. The relu is not decoration.
+Without it the two matmuls are one linear map and the mathematically right
+move is to collapse them into a single small matrix, which the optimizer's own
+associativity rule would happily do. The relu blocks the collapse, exactly as
+it does in a real network, and leaves fusion as the interesting option.
 
-The two canonical programs are built directly:
+Correct is defined by the reference interpreter. It evaluates a term with the
+most obvious code possible, triple-loop matmuls, a textbook stable softmax,
+nothing fast about it. Its job is to be so plainly right that it can serve as
+the referee: any kernel this project ever produces must match it to within
+1e-5, or the kernel's speed does not count. A fast wrong kernel is worth
+nothing.
 
-```rust
-// O_sd = softmax((Q_sd · K_sdᵀ) · scale) · V_sd
-pub fn naive_attention_program() -> (RecExpr<TensorLang>, Id) { ... }
+Cost is measured by the accountant. It walks a program and counts, under an
+explicit and deliberately pessimistic model, the flops and the bytes that
+would move if every intermediate were written to HBM. A matmul of [m,k] by
+[k,n] is `2 m k n` flops and writes `m n` numbers at four bytes each. A relu
+or emul touches each element once. Inputs are read once. This "everything is
+materialized" model is the baseline the project exists to beat, and its
+inaccuracy against real hardware is not hidden, it is milestone 1's
+calibration work and it is recorded as deferred until a real accelerator is
+available.
 
-// Y = (X_sf · W_up_fi) · W_dn_io   (the up/down projection M5 will fuse)
-pub fn naive_mlp_program() -> (RecExpr<TensorLang>, Id) { ... }
-```
-
-### The reference interpreter defines truth
-
-The interpreter evaluates a `TensorLang` term on plain `Vec<f32>` tensors with the
-most obvious, naive implementation possible, triple-loop matmul, straightforward
-softmax. It is not fast and is not meant to be. Its job is to be *so obviously
-correct* that it can serve as the oracle: any optimized kernel the system ever
-produces must match this interpreter to `1e-5`. A fast wrong kernel is worth
-nothing, so correctness is anchored to something no one can doubt.
-
-```rust
-pub struct TensorData { pub shape: Vec<usize>, pub data: Vec<f32> }
-
-pub fn eval(expr: &RecExpr<TensorLang>, root: Id,
-            env: &HashMap<String, TensorData>) -> TensorData {
-    match expr[root].clone() {
-        TensorLang::Var(sym)        => env[sym.as_str()].clone(),
-        TensorLang::MatMul([a, b])  => matmul_2d(&eval(..a..), &eval(..b..)),
-        TensorLang::Transpose([a])  => transpose_2d(&eval(..a..)),
-        TensorLang::EMul([a, b])    => emul_broadcast(&eval(..a..), &eval(..b..)),
-        TensorLang::Softmax([a])    => softmax_last(&eval(..a..)),
-        TensorLang::Fuse([a])       => eval(..a..),   // identity on value
-    }
-}
-```
-
-The softmax is the numerically stable version (subtract the row max before
-exponentiating) because a naive `exp` overflows. That detail matters: the oracle
-has to be *correct*, including numerically, or the 1e-5 gate is meaningless.
-
-### The accountant measures the real costs
-
-The cost model cannot be trusted if it is never checked against reality. The
-accountant walks a program and returns the true FLOPs and HBM bytes under an
-explicit, simple model:
-
-```rust
-pub struct Account { pub flops: u64, pub hbm_bytes: u64 }
-```
-
-The HBM model is **"every intermediate is materialized to HBM"**: each operation
-reads its inputs from HBM and writes its output back. Per node:
-
-- `MatMul [m,k]·[k,n]`: `2·m·k·n` FLOPs, writes `m·n·4` bytes (f32 = 4 bytes).
-- `EMul` over `n` elements: `n` FLOPs, writes `n·4` bytes.
-- `Softmax` over `n` elements: `~4·n` FLOPs (max, exp, sum, divide), writes `n·4`.
-- `Transpose`: 0 FLOPs, writes the transposed copy.
-- `Var` (input): reads `numel·4` bytes from HBM.
-
-This is deliberately the *naive, pessimistic* model, it is the baseline the whole
-project exists to beat. It is honest about being crude: real hardware overlaps
-compute and memory, and not every intermediate truly spills. Calibrating this model
-against measured wall-clock is M1's job, and the gap between predicted and measured
-is treated as the next research question, not hidden. The trade-off here is
-intentional: a simple, transparent model you can fully reason about, with its
-inaccuracy made explicit and turned into future work, beats a complicated model you
-cannot audit.
-
-`Account::intensity()` returns `flops / hbm_bytes`, the arithmetic intensity that
-places a program on the roofline. For naive attention it comes out around 9–11
-flops/byte regardless of sequence length, which is exactly why attention is
-bandwidth-bound: that number sits far below any accelerator's ridge point (~156 for
-A100, ~295 for H100).
+Divide the two counts and you get flops per byte, which places a program on
+the roofline plot from section 2. For naive attention the accountant reports
+about 9 to 11 regardless of sequence length. That number is the whole story of
+why attention is memory-bound.
 
 ---
 
-## 6. rl-cost: the roofline cost model
+## 8. rl-cost, the cost model
 
-This crate is the core idea in code. It is small, and that smallness is the point
-the value is in the shape of the abstraction, not the volume.
+The smallest crate, on purpose, because it is the idea itself.
 
-### Device
-
-A device is its peak resources:
+A device is its peak numbers:
 
 ```rust
-pub struct Device { pub name: &'static str, pub peak_flops: f64, pub hbm_bandwidth: f64 }
-
 pub const A100: Device = Device::new("A100-80GB", 312e12, 2.0e12);
 pub const H100: Device = Device::new("H100-SXM", 989e12, 3.35e12);
-
-impl Device { pub fn ridge_point(&self) -> f64 { self.peak_flops / self.hbm_bandwidth } }
 ```
 
-The **ridge point** is peak FLOPs divided by peak bandwidth: the arithmetic
-intensity at which a program stops being memory-bound and starts being
-compute-bound. A100 sits at ~156 flops/byte, H100 at ~295. Anything below the ridge
-is bandwidth-limited.
-
-### The Constraint trait
-
-A constraint maps a program's demand on one resource to a lower bound on time:
+A constraint turns a program's demands into a floor on time:
 
 ```rust
 pub trait Constraint {
     fn name(&self) -> &str;
     fn lower_bound_s(&self, flops: u64, hbm_bytes: u64) -> f64;
 }
-
-struct FlopsConstraint { device: Device }   // flops / peak_flops
-struct HbmConstraint   { device: Device }   // hbm_bytes / hbm_bandwidth
 ```
 
-`FlopsConstraint` returns `flops / peak_flops`: the time if compute were the only
-limit. `HbmConstraint` returns `hbm_bytes / hbm_bandwidth`: the time if bandwidth
-were the only limit. Each is a *lower bound*, the resource cannot go faster than
-its peak, so the op cannot finish sooner than this.
+`FlopsConstraint` returns flops divided by peak flops. `HbmConstraint` returns
+bytes divided by bandwidth. The cost model holds a list of constraints,
+evaluates all of them, and returns the largest time along with the name of the
+constraint that produced it, the binding resource. That name is the diagnostic
+payoff: run `cargo run -p rl-cost --example m1_binding` and it prints
+`binding=HbmBytes` for attention across a sweep of shapes, which is the
+machine telling you what Tri Dao knew.
 
-### The cost model: slowest resource wins
-
-```rust
-pub struct CostModel { constraints: Vec<Box<dyn Constraint>> }
-
-impl CostModel {
-    pub fn add(mut self, c: impl Constraint + 'static) -> Self { ... }   // builder
-    // returns (best_time_s, binding_resource_name, per_constraint_times)
-    pub fn cost(&self, flops: u64, hbm_bytes: u64) -> (f64, String, Vec<(String, f64)>) { ... }
-}
-```
-
-`cost()` evaluates every constraint and returns the **maximum** time (the slowest
-resource), the name of the constraint that produced it (the **binding** resource),
-and the full breakdown. The breakdown is kept because the binding resource is the
-whole diagnostic value: the model does not just say "1.6 ms," it says "1.6 ms,
-HBM-bound." That label is what tells a human (or the optimizer) *what to fix*.
-
-The extensibility is the entire payoff. Adding occupancy, communication volume, or
-SRAM capacity is a new struct implementing `Constraint` plus a field on `Device`.
-The `cost()` method never changes. That is what makes "the cost model was missing a
-constraint" a small, local fix.
-
-### Calibration, honestly
-
-M1's real done-criterion is that the model predicts the *naive* case within a
-tolerance of measured wall-clock and prints the binding resource. The binding-resource
-half is done and verifiable on any machine (`cargo run -p rl-cost --example
-m1_binding` prints `binding=HbmBytes` for attention across a shape sweep). The
-"within X% of measured wall-clock" half genuinely needs an accelerator to measure
-against, so it is deferred and labelled as such rather than faked. That deferral is
-recorded in the milestone tracker and the checkpoints; pretending it is done would
-violate the project's own rules.
+Adding a constraint never touches the existing ones. SRAM capacity, occupancy,
+communication for multi-chip, each is a new twenty-line struct and a field on
+the device. That is what makes "the model was missing a constraint" a small
+fix instead of a redesign.
 
 ---
 
-## 7. rl-opt: e-graphs, rewrites, shapes, extraction
+## 9. rl-opt, the e-graph and the extractor
 
-This crate is where equivalent forms are generated and the cheapest is chosen. It is
-the most conceptually dense, so this section builds the e-graph idea from scratch.
+This is the crate where equal programs are generated and the cheapest one is
+chosen, and it is the densest part, so here is the idea from scratch.
 
-### What an e-graph is, and why
+Suppose you know that `(A x B) x C` equals `A x (B x C)`. If you rewrite a
+program by replacing one with the other, you have destroyed the original, and
+maybe the original was better. You want to keep both and decide later. Apply
+that across many rules and many subterms and the number of variants explodes.
 
-Suppose you have a rule `(A·B)·C = A·(B·C)`. If you rewrite a program by *replacing*
-the left side with the right side, you have thrown away the original, and maybe the
-original was better. You want to keep *both* and decide later. Do that across many
-rules and you get a combinatorial explosion of equivalent programs to store.
+An e-graph stores them all compactly. It groups expressions into equivalence
+classes, e-classes, where everything in a class is proven equal to everything
+else, and a node points to child classes rather than child expressions, so one
+small structure represents an enormous set of concrete programs. Saturation
+means applying every rewrite rule until nothing new appears. After saturation
+the e-graph holds every program your rules can reach.
 
-An **e-graph** (equivalence graph) stores all of them compactly. It groups
-expressions into **e-classes**, where every member of an e-class is proven equal to
-every other. A node's children point to e-classes, not to single expressions, so one
-node can represent many concrete trees at once. **Equality saturation** is the
-process of applying all rewrite rules over and over until no rule adds anything new
-(the e-graph is "saturated"). At that point the e-graph holds, compactly, the entire
-space of programs reachable by your rules.
-
-This is exactly the structure the optimizer needs: generate every equivalent form,
-then extract the cheapest. `egg` is the Rust library that provides it, and
-`risinglight` (an educational analytic database) demonstrates using `egg` for query
-optimization, the direct template for using it here on tensors.
-
-### The rewrite rules
-
-The rules are the algebra. Each one encodes a mathematical identity that produces an
-equivalent program. They are written generically over the e-graph's analysis so the
-same rules work with or without shape information:
+The rules are plain algebra, each one a mathematical identity:
 
 ```rust
-// associativity: regroup chained matmuls (changes work, not result)
+// regrouping a matmul chain changes the work, not the answer
 "(matmul (matmul ?a ?b) ?c)"  <=>  "(matmul ?a (matmul ?b ?c))"
 
-// transpose distributes over matmul (and back)
+// a transpose can move through a matmul
 "(transpose (matmul ?a ?b))"  =>   "(matmul (transpose ?b) (transpose ?a))"
 
-// a scalar scale can move across a matmul to whichever side is cheaper
+// a scalar scale can be applied before or after a matmul
 "(matmul (emul ?a ?s) ?b)"    <=>  "(emul (matmul ?a ?b) ?s)"
+
+// a producer consumed immediately by a matmul can run as one kernel
+"(matmul (softmax ?x) ?v)"    =>   "(fuse (matmul (softmax ?x) ?v))"
+"(matmul (relu ?x) ?v)"       =>   "(fuse (matmul (relu ?x) ?v))"
 ```
 
-The `scale_distrib` rules matter for a concrete reason: in attention the scale
-`1/√d` can be applied to the small `Q_sd` before the matmul, or to the large
-`scores_ss` after it. Same result, different cost. The e-graph holds both and lets
-the cost model choose.
+The scale rule is a nice concrete case: in attention the 1 over sqrt(d) factor
+can multiply the small Q matrix before the big matmul or the large score
+matrix after it. Same answer, different bytes. The e-graph keeps both and the
+cost model decides.
 
-A hard rule of the project (see `CLAUDE.md` rule 4): there is **no canned
-`naive => flash` rewrite**. The fused form must be *reachable* by composing
-primitive, general identities and then *selected* by the cost model. Hard-coding the
-answer as a single pattern-match would mean the optimizer "discovered" nothing.
+A hard project rule, rule 4 in `CLAUDE.md`: there is no rewrite that says
+"attention becomes Flash Attention". The fused forms must be reachable by
+composing small general identities, like the two fusion rules above, which
+know nothing about attention or MLPs. Hard-coding the destination would mean
+the optimizer discovered nothing.
 
-### The shape analysis
-
-To cost a node by real bytes, the optimizer must know each e-class's shape. The
-e-graph does not track that on its own, so we attach an `egg::Analysis` that
-propagates shapes bottom-up:
-
-```rust
-pub struct ShapeAnalysis { pub inputs: HashMap<String, Vec<usize>> }
-
-impl Analysis<TensorLang> for ShapeAnalysis {
-    type Data = Option<Vec<usize>>;   // each e-class's [rows, cols], None if unknown
-
-    fn make(egraph, enode) -> Self::Data {
-        match enode {
-            Var(sym)       => egraph.analysis.inputs.get(sym).cloned(),
-            MatMul([a, b]) => Some(vec![shape(a)[0], shape(b)[1]]),
-            Transpose([a]) => Some(vec![shape(a)[1], shape(a)[0]]),
-            EMul([a, b])   => non_scalar_of(a, b),
-            Softmax([a]) | Fuse([a]) => shape(a),
-        }
-    }
-    fn merge(...)  // equivalent terms must agree on shape; keep the known one
-}
-```
-
-`make` computes a node's shape from its children's shapes (input shapes come from the
-`inputs` map). `merge` combines the shape estimates when two terms join the same
-e-class; since equivalent terms have the same shape, it just keeps the known value. A
-genuine disagreement would indicate a buggy rewrite, surfaced here rather than
-silently producing a wrong plan. This analysis is the M3 prerequisite that was just
-built: `cargo test -p rl-opt` confirms the attention output e-class carries shape
-`[s, d]` after saturation.
-
-### Extraction, and the honest extractor story
-
-Once the e-graph is saturated, **extraction** chooses one concrete program: pick one
-node per e-class to minimize total cost. There is a subtlety that the project's rule
-6 calls out in advance. The default `egg` extractor computes *tree* cost, which
-double-counts shared subexpressions, and attention reuses `Q`, `K`, `V` heavily, so
-tree cost would badly misprice it. This is the exact wall the Tensat project hit.
-
-The correct tool is a **DAG-aware** extractor that counts each shared tensor once.
-`egg::LpExtractor` does this with integer linear programming, but it depends on the
-`coin_cbc` solver, a C library that is not available on this machine. So the plan
-(recorded in the checkpoints) is a custom memoized DAG extractor that reads the
-shape analysis to compute real per-e-class bytes and counts each materialized
-e-class once, documented as the CBC-free substitute. The self-assessment harness
-(`scripts/assess.py`) actively flags the current placeholder extractor until this is
-done, so the gap cannot be quietly forgotten.
+To cost plans the e-graph needs shapes, so a shape analysis rides along during
+saturation and gives every e-class its [rows, cols]. And then comes
+extraction, picking one concrete program out of the saturated e-graph, which
+has a famous trap. The default extractor in the `egg` library scores trees,
+which counts a shared input once per use. Attention uses Q, K, V all over the
+place, so tree scoring double-counts them badly; the Tensat project hit
+exactly this wall. The exact fix is integer linear programming
+(`egg::LpExtractor`), but its solver is a C library that does not build on
+this machine, so the repo uses a custom extractor instead: a greedy bottom-up
+pass driven by the real cost model, with a cycle guard, that prices each
+e-class from its true shape, and then a second stage that asks whether
+wrapping the winning plan in `fuse` makes it cheaper under the active
+constraints. Stage two is where the A/B flip physically happens. Greedy is not
+guaranteed optimal and the README says so plainly; exact extraction is listed
+as future polish, not assumed.
 
 ---
 
-## 8. The fuse primitive: how fusion saves HBM
+## 10. fusion, the trick the optimizer has to find
 
-This is the most recent piece and the one that makes the A/B *possible*, so it gets
-its own section.
+Fusion deserves its own picture because it is the thing the whole experiment
+turns on.
 
-Naive attention writes the `seq×seq` score matrix to HBM, reads it back for the
-softmax, writes the probabilities, reads them back for the output matmul. For long
-sequences that traffic dominates everything. Fusion means: compute the whole chain
-as one kernel and keep those intermediates in SRAM, so they never touch HBM.
+The naive attention plan computes the score matrix, writes all 16 MB of it to
+HBM, reads it back to scale it, writes the result, reads that back for
+softmax, writes the probabilities, reads them again for the final matmul. The
+math is four steps, the memory bill is the same giant table moved over and
+over.
 
-![naive vs fused HBM traffic](docs/figures/fusion.png)
+![naive against fused HBM traffic](docs/figures/fusion.png)
 
-*same math, two schedules. the naive plan round-trips the s×s scores and
-probabilities through HBM (four arrows down to HBM); the fused plan keeps them in
-SRAM and only the inputs and the final output touch HBM (two arrows). the value is
-identical, the HBM bill is not.*
+*same math, two schedules. on the left every stage writes its result down to
+slow memory and the next stage reads it back. on the right the whole chain
+runs as one kernel, the big tensors live and die in fast memory, and only the
+inputs and the final output ever touch HBM.*
 
-The `fuse` node models this. It is **value-identity**, wrapping a subgraph in
-`fuse` does not change the result, so the interpreter treats it as a pass-through and
-the 1e-5 numerics gate still holds. What changes is accounting: a fused region is
-charged HBM only for its boundary inputs and final output, never its internal
-intermediates.
+In the language this is the `fuse` node. Wrapping a subtree in `fuse` changes
+nothing about the value, the interpreter just evaluates the inside, so the
+1e-5 correctness gate still applies. What changes is the accounting: a fused
+region is charged HBM only for its distinct inputs and its final output, never
+for what happens in between. The same node fuses the MLP, where the tensor
+that never spills is the s by f hidden activation matrix instead of the s by s
+scores. Two tests pin the contract for each program: fused output equals naive
+output to 1e-5, and fused bytes are smaller by at least one full tile of the
+big intermediate while flops stay exactly equal.
 
-```rust
-TensorLang::Fuse([a]) => {
-    // sum all flops in the subtree, but count HBM only for distinct leaf inputs
-    // and the final output, internal intermediates stay in SRAM.
-    let (flops, leaf_bytes, out_shape) = fused_walk(expr, a, shapes);
-    acc.flops     += flops;
-    acc.hbm_bytes += leaf_bytes + out_bytes(out_shape);
-}
-```
-
-Crucially this is a **general** primitive, "a producer consumed immediately need not
-spill", not an attention special case. The same node fuses the MLP up/down
-projection in M5. That generality is what keeps it honest under rule 4.
-
-This is verified by `cargo test -p rl-ir --test fuse`:
-
-- `fused_attention_matches_naive_numerically`: fused output equals naive to < 1e-5.
-- `fused_attention_cuts_hbm`: fused HBM is strictly lower, saving at least one full
-  `seq×seq` tile, while FLOPs stay exactly equal.
-
-**The honest caveat, stated loudly:** fusing the whole `seq×seq` region assumes it
-fits in SRAM. Real Flash Attention works precisely because it *tiles*, it keeps only
-a small block in SRAM at a time. The capacity limit that forces tiling is not yet
-modelled. Adding an **SRAM-capacity constraint** that forces tiling for large `seq`
-is the next `impl Constraint`, and it is the perfect example of the whole thesis: a
-missing constraint, added in one place, not a search hack.
+The caveat, stated loudly because it is the next piece of real work: treating
+the whole fused region as free of memory traffic assumes the working set fits
+in SRAM. Real Flash Attention tiles precisely because it does not fit. The
+missing piece is an SRAM capacity constraint that forces tiling at large
+sizes, and the satisfying part is that this gap is itself an instance of the
+project's one rule. The model is missing a constraint. The fix is twenty
+lines in `rl-cost`, not a rewrite of anything.
 
 ---
 
-## 9. The milestones, M0 through M5
+## 11. rl-codegen, the kernel that proves it
 
-The project advances in milestones. The iron rule: **each milestone ends in a
-benchmark number, not a refactor.** Nothing is "done" until its numeric criterion is
-met and recorded.
+Until milestone 4 the fused plan was an accounting claim. This crate makes it
+an executable one.
 
-| milestone | goal | done-criterion | status |
-|---|---|---|---|
-| **M0** | substrate, IR, reference interpreter | naive attention and MLP match a JAX/NumPy fixture to 1e-5; a microbench prints true flops/hbm | **done** (err 2.98e-8) |
-| **M1** | roofline cost model | predict the naive case and print the binding resource; calibrate vs measured within tolerance | **done** for binding-resource; wall-clock calibration deferred (needs accelerator) |
-| **M2** | egg + primitive rewrites | after saturation the e-graph provably contains equivalent forms | **done** (assoc, transpose, scale distribution) |
-| **M3** | cost-driven extraction + the A/B | under `[Flops]` extract naive; under `[Flops, HbmBytes]` extract fused, same e-graph | **done**: `the_ab_flip` and `extractor_flips_with_hbm_constraint` pass; a custom DAG-honest extractor (no tree `Extractor`) drives the flip; exact ILP extraction is future polish |
-| **M4** | lower to a real kernel + verify | kernel matches reference to 1e-5, beats naive at seq >= 2048; record gap | **done (CPU)**: rl-codegen emits a fused online-softmax kernel; matches reference <1e-5 through s=2048; 1.57x faster than naive at s=2048; s=4096 gap (1.5e-5) is the f32 reference limit, recorded; GPU Pallas deferred |
-| **M5** | beat `ragged_dot` + the ledger | fused MLP beats `jax.lax.ragged_dot` for F>D; both headline numbers reproducible via `roofline replay` | not started |
+`lower()` looks at the plan the optimizer chose. A plan with a `fuse` node
+whose chain contains a softmax lowers to the fused attention kernel; a fused
+chain with a relu lowers to the fused MLP kernel; anything else falls back to
+the reference interpreter. The optimizer's decision is what selects the fast
+path, there is no flag anywhere saying "use the fast kernel".
 
-Current test counts (all green): rl-ir 5, rl-cost 4, rl-opt 8 (including
-`the_ab_flip` and `fused_form_is_reachable_by_rewrite`).
+The fused attention kernel is the online softmax, the same idea at the heart
+of Flash Attention: walk the keys one at a time keeping a running maximum, a
+running sum, and a running weighted output, so the s by s score matrix never
+exists anywhere. The fused MLP kernel streams one token row at a time, computes
+its hidden activations into a buffer the size of one row, applies the relu,
+multiplies by the down projection, and moves on, so the s by f hidden matrix
+never exists either. Both kernels do the arithmetic in the same order as the
+reference interpreter on purpose, no extra tricks, so the comparison measures
+fusion and nothing else.
 
-The ordering is dependency-strict. M0 (the unglamorous reference interpreter) comes
-first because it makes every later number honest. M1 must calibrate before M3 is
-allowed to choose between plans, a cost model that cannot predict the naive case has
-no business ranking alternatives.
-
----
-
-## 10. Design decisions and trade-offs
-
-Every real decision has a cost. The notable ones, with the trade-off made explicit:
-
-- **Rust core, not Python.** Trade-off: more friction writing it, far more speed and
-  type safety, and a single artifact. Justified because `toydb` proves a full system
-  fits in ~15k lines of Rust, and the hot path must be fast.
-- **Tiny IR (six node types).** Trade-off: cannot express arbitrary programs yet, but
-  the interpreter is trivially correct and the whole space is auditable. v0 needs one
-  honest result, not generality.
-- **Naive "materialize everything" HBM model.** Trade-off: inaccurate against real
-  hardware, but transparent and fully reasoned. Its inaccuracy is turned into M1
-  calibration work rather than hidden.
-- **Cost model as a trait, separate crate.** Trade-off: a little ceremony, but
-  constraints become independently testable and addable. This is the prime directive
-  made structural.
-- **e-graph instead of greedy rewriting.** Trade-off: more memory and the extraction
-  problem, but you never throw away a form that turns out better. The extraction
-  problem is real (see DAG vs tree below) and is acknowledged up front.
-- **`fuse` as value-identity.** Trade-off: it models fusion's HBM saving without
-  modelling SRAM capacity, so it over-claims for huge tensors. The fix (an SRAM
-  constraint that forces tiling) is named and deferred, not pretended away.
-- **DAG extraction without ILP.** Trade-off: `LpExtractor` would be exact but needs a
-  C solver unavailable here; a custom memoized extractor is approximate but builds
-  everywhere. Documented as a substitute, not silently swapped.
-- **Forward pass only, no training in v0.** Trade-off: narrower scope, but the value
-  is demonstrable in one run. Backprop is a later transformation over the same
-  e-graph, not a rewrite of the system.
-
----
-
-## 11. Honest limitations and prior art
-
-This is not unprecedented and the README will not pretend it is. **Tensat** (MLSys
-2021) and **SPORES** already used `egg` for tensor and linear-algebra
-superoptimization. **XLA**, **TVM/Ansor**, **tinygrad**, and **Mojo** all do
-cost-based kernel scheduling. Where the analogy to databases strains: SQL
-optimization is dominated by *cardinality estimation* (guessing how many rows a
-filter passes), which is data-dependent and statistical. Tensor programs are mostly
-statically shaped and dense, so the hard part moves from "estimate selectivity" to
-"model the device accurately." That shift is the point, not a flaw, it is why the
-cost model, not the search, carries the intelligence.
-
-The defensible, novel core is three things, none of which those systems center:
-
-1. **An extensible, eventually-learned cost model** where "the optimizer was wrong"
-   decomposes into "a constraint was missing" by construction.
-2. **A hybrid rewrite engine**: hand-written algebra plus, later, a *verified* LLM
-   rewrite proposer that only admits a rewrite after it passes numerics and the
-   benchmark.
-3. **Recursion of the same idea up the stack**: cost-based search at the kernel
-   level (v0), the rewrite-proposal level (v1), and the scaling-law
-   experiment-design level (v2).
-
-Current concrete limitations: no real kernel emission yet (M4), no accelerator
-calibration (M1's deferred half), the extractor is still the placeholder (M3), and
-the fuse model ignores SRAM capacity. All are tracked, none are hidden.
-
----
-
-## 12. Build, test, run, resume
+The gates, in order. First numerics: the kernels must match the reference
+interpreter to 1e-5 across a sweep of shapes, enforced by unit tests, before
+any speed number counts. Then wall clock. On this machine (CPU, since there is
+no accelerator here) the fused attention kernel at d=64 measured 1.28 times
+naive at s=1024, 1.57 times at s=2048, 1.21 times at s=4096, with errors
+3.0e-6, 5.8e-6, 1.5e-5. Run it yourself:
 
 ```bash
-# Rust toolchain lives at C:\Users\bhansa01\.cargo\bin (on the User PATH, gnu).
-cargo build --workspace
-cargo test  --workspace                       # all numerics + unit tests
-
-cargo run -p rl-ir   --example m0_numbers     # ground-truth flops/hbm sweep
-cargo run -p rl-cost --example m1_binding      # binding resource per shape
-cargo test -p rl-ir  --test fuse               # fusion: correct + cuts HBM
-
-python scripts/assess.py                       # objective score; gates commits/pushes
-python scripts/figures.py                      # regenerate the README diagrams
+cargo run -p rl-codegen --release --example m4_bench
 ```
 
-To resume work across sessions:
-
-1. Read `CLAUDE.md` (operating rules, milestone checklist).
-2. Read this README.
-3. Read the newest file in `quality_reports/checkpoints/`.
-4. `python scripts/assess.py --start`, then `cargo test --workspace` to confirm green.
-5. Do the first action listed in that checkpoint.
-
-The full development process, the self-assessment loop, commit and checkpoint
-discipline, context-budget rules, and how to set this workflow up in a new project
-lives in `WORKFLOW.md`.
+The honest wrinkle in those numbers: at s=4096 the error, 1.5e-5, is over the
+gate. That was investigated rather than waved away, and the cause is the f32
+reference interpreter's own accumulation error at that size, not a kernel bug.
+Giving the fused kernel f64 accumulators did not shrink the gap, which is what
+shows the reference is the limiting side. The gate holds through s=2048, the
+tested sweep stays in that range, and the wrinkle is recorded here and in the
+milestone notes instead of being deleted. GPU kernel emission (Pallas or
+Triton) is deferred until there is hardware to run it on.
 
 ---
 
-## 13. Glossary
+## 12. the milestones and their numbers
 
-- **Tensor**, a multi-dimensional array of numbers. A matrix is a 2-D tensor.
-- **Shape suffix**, the convention of writing a tensor's shape into its name:
-  `Q_sd` is `[seq, dim]`.
-- **FLOPs**, floating-point operations; the amount of arithmetic.
-- **HBM**, High Bandwidth Memory; the GPU's large, relatively slow memory.
-- **SRAM**, the GPU's small, very fast on-chip memory.
-- **Arithmetic intensity**, FLOPs per byte moved; where a program sits on the
+The iron rule: a milestone ends in a benchmark number, not a refactor. Nothing
+is done until its numeric criterion is met and written down.
+
+| milestone | what it proves | the number | status |
+|---|---|---|---|
+| M0 | the language, interpreter, and accountant are trustworthy | matches a NumPy fixture, max error 2.98e-8 | done |
+| M1 | the cost model names the binding resource | `binding=HbmBytes` for attention across the sweep | done, wall-clock calibration deferred until real hardware |
+| M2 | the rewrites generate genuinely different forms | saturated e-graph provably contains them | done |
+| M3 | the A/B flip | flops-only extracts naive, adding HBM extracts fused, same e-graph | done, `the_ab_flip` and `extractor_flips_with_hbm_constraint` pass |
+| M4 | the chosen plan runs and wins for real | matches reference under 1e-5 through s=2048, 1.57x naive at s=2048 | done on CPU, GPU deferred |
+| M5 | the same machinery wins on a second program, and results replay | fused MLP beats the naive path for f greater than d, both headline numbers reproduce via `roofline replay` | in progress |
+
+M5 so far: the relu node, the realistic MLP program, the general relu fusion
+rule, the streaming MLP kernel, and the MLP versions of the reachability and
+flip tests are all in and green, 26 tests across the workspace. Still to come:
+the preregistered MLP benchmark and the ledger with replay. The original M5
+target, beating `jax.lax.ragged_dot` on an A100, needs the A100, so like M1
+and M4 the criterion is run honestly on CPU and the GPU half is recorded as
+deferred rather than faked.
+
+---
+
+## 13. how the work stays honest
+
+This project is built across many separate coding sessions, which creates
+three standing risks: losing state between sessions, grading your own work
+generously, and claiming things that were never measured. The defenses are
+mechanical, not aspirational, and live in `WORKFLOW.md`.
+
+A scoring script, `scripts/assess.py`, computes a 0 to 100 score from machine
+signals only. A failed build or failed test is an automatic zero. A headline
+number moving the wrong way is a regression and blocks the push. The script
+also greps for violations of the project's hard rules, like a hard-coded
+naive-to-flash rewrite. The agent doing the work never assigns its own score.
+
+Benchmarks are preregistered. Before a benchmark that produces a claim is run,
+the configuration, the metric, and the success threshold get committed to the
+ledger. The result is compared against what was preregistered, which closes
+the door on quietly moving the goalposts after seeing the data.
+
+And every stopping point writes a checkpoint file stating what is done, what
+is half done, what is verified against what is merely believed, and the exact
+next actions, so the next session resumes instead of re-deriving.
+
+---
+
+## 14. what this is not
+
+Prior art exists and the README will not pretend otherwise. Tensat and SPORES
+used e-graphs for tensor and linear algebra optimization before this. XLA,
+TVM, tinygrad, and Mojo all do cost-based kernel scheduling in production.
+The analogy to databases also strains in one place: SQL optimization is
+dominated by guessing how many rows survive each filter, which is statistical
+and data-dependent, while tensor shapes are known exactly, so the hard part
+moves from estimating data to modeling the device. That shift is the point of
+the project rather than a flaw in it.
+
+What is genuinely this project's own: the discipline that every optimizer
+failure must decompose into a missing physical constraint, made structural by
+keeping the cost model a separate pluggable crate; and the insistence that the
+fused forms be reached by general algebra and selected by cost, never
+pattern-matched in.
+
+Current real limitations, all tracked, none hidden: no GPU numbers anywhere
+yet, the extractor is greedy rather than exact, the fuse model ignores SRAM
+capacity, and the cost model's wall-clock predictions are uncalibrated until
+there is an accelerator to calibrate against.
+
+---
+
+## 15. build, test, run, resume
+
+```bash
+# Rust toolchain lives at C:\Users\bhansa01\.cargo\bin (gnu, on the User PATH).
+cargo build --workspace
+cargo test  --workspace                        # numerics gates + unit tests
+
+cargo run -p rl-ir   --example m0_numbers      # true flops and bytes per shape
+cargo run -p rl-cost --example m1_binding      # which resource binds, per shape
+cargo run -p rl-codegen --release --example m4_bench   # naive vs fused, timed
+
+python scripts/assess.py                       # the objective score, gates pushes
+python scripts/figures.py                      # regenerate the README figures
+```
+
+To resume work in a fresh session:
+
+1. read `CLAUDE.md`, then this README
+2. read the newest file in `quality_reports/checkpoints/`
+3. run `python scripts/assess.py --start`, then `cargo test --workspace`
+4. do the first action listed in that checkpoint
+
+---
+
+## 16. small glossary
+
+- tensor: a rectangular array of numbers. A matrix is a 2-D tensor.
+- flop: one floating point operation. A measure of arithmetic, not of time.
+- HBM: the GPU's big slow memory.
+- SRAM: the GPU's tiny fast memory, where compute actually happens.
+- arithmetic intensity: flops per byte moved. Where a program sits on the
   roofline.
-- **Roofline**, a model plotting achievable performance against arithmetic
-  intensity, with a memory-bound region and a compute-bound region.
-- **Ridge point**, the intensity where memory-bound meets compute-bound
-  (peak_flops / peak_bandwidth).
-- **Binding resource**, the constraint that produces the maximum (slowest) time;
-  the thing actually limiting the program.
-- **e-graph**, a data structure that compactly stores many equivalent programs,
-  grouped into e-classes of proven-equal expressions.
-- **Equality saturation**, applying rewrite rules to an e-graph until no rule adds
-  anything new.
-- **Extraction**, choosing one concrete program out of a saturated e-graph by
-  minimizing a cost function.
-- **DAG-aware extraction**, extraction that counts shared subexpressions once
-  rather than double-counting them (tree cost).
-- **Fusion**, running several operations as one kernel so intermediates stay in
-  SRAM and never spill to HBM.
-- **Flash Attention**, an attention kernel that avoids materializing the
-  `seq×seq` score matrix by tiling; the human-found version of what this optimizer
-  aims to find automatically.
-- **Constraint**, one physical resource's lower bound on time, in the cost model.
-- **Preregistration**, committing a benchmark's config, metric, and success
-  threshold *before* running it, so results cannot be retrofitted.
+- ridge point: peak flops divided by peak bandwidth. Below it you wait on
+  memory, above it you wait on math.
+- binding resource: the constraint producing the slowest lower bound, the
+  thing actually limiting the program.
+- e-graph: a structure holding many programs proven equal, grouped into
+  e-classes.
+- saturation: applying rewrite rules until nothing new appears.
+- extraction: choosing the single cheapest program out of a saturated e-graph.
+- fusion: running a chain of operations as one kernel so the stuff in the
+  middle never touches slow memory.
+- preregistration: committing the benchmark config and success threshold
+  before running it.
 
 ---
 
-## 14. Roadmap
+## 17. what comes next
 
-- **Finish M3**: the cost-driven DAG extractor and the A/B test, turning the top
-  figure into a passing assertion.
-- **M4**: emit a real Pallas kernel from the chosen plan, verify it to 1e-5, beat
-  naive at large sequence length, and record the predicted-vs-measured gap.
-- **M5**: beat `jax.lax.ragged_dot` on the fused MLP up/down projection for F>D, and
-  stand up the ledger so both headline numbers replay from preregistered configs.
-- **Beyond v0**: an SRAM-capacity constraint that forces tiling; a verified LLM
-  rewrite proposer; and the same cost-based search lifted to scaling-law experiment
-  design (choosing the next training run by expected information gain).
+Finish M5: the preregistered fused MLP benchmark and the ledger, so both
+headline numbers reproduce from one `roofline replay` command. After that, in
+rough order: an SRAM capacity constraint that forces tiling at sizes where the
+fused region cannot fit, real GPU kernel emission once hardware is available,
+calibration of predicted against measured time on that hardware, and further
+out, a rewrite proposer that suggests new algebraic identities and only admits
+them after they pass the same numerics and benchmark gates as everything else.
 
-This README grows with the project. When a milestone lands, its section moves from
-"in progress" to "done" with the number that earned it, and any new crate, decision,
-or trade-off is written up here in the same style.
+This file grows with the project. When a milestone lands, its row in the table
+gets the number that earned it.
