@@ -6,3 +6,5 @@ edition = "2021"
 [dependencies]
 rl-ir  = { path = "../rl-ir" }
 rl-opt = { path = "../rl-opt" }
+rl-cost = { path = "../rl-cost" }
+egg = "0.9"

@@ -563,7 +563,7 @@ met and recorded.
 | **M1** | roofline cost model | predict the naive case and print the binding resource; calibrate vs measured within tolerance | **done** for binding-resource; wall-clock calibration deferred (needs accelerator) |
 | **M2** | egg + primitive rewrites | after saturation the e-graph provably contains equivalent forms | **done** (assoc, transpose, scale distribution) |
 | **M3** | cost-driven extraction + the A/B | under `[Flops]` extract naive; under `[Flops, HbmBytes]` extract fused, same e-graph | **done**: `the_ab_flip` and `extractor_flips_with_hbm_constraint` pass; a custom DAG-honest extractor (no tree `Extractor`) drives the flip; exact ILP extraction is future polish |
-| **M4** | lower to a real kernel + verify | kernel matches reference to 1e-5, beats naive at seq ≥ 2048; record predicted-vs-measured gap | not started |
+| **M4** | lower to a real kernel + verify | kernel matches reference to 1e-5, beats naive at seq >= 2048; record gap | **done (CPU)**: rl-codegen emits a fused online-softmax kernel; matches reference <1e-5 through s=2048; 1.57x faster than naive at s=2048; s=4096 gap (1.5e-5) is the f32 reference limit, recorded; GPU Pallas deferred |
 | **M5** | beat `ragged_dot` + the ledger | fused MLP beats `jax.lax.ragged_dot` for F>D; both headline numbers reproducible via `roofline replay` | not started |
 
 Current test counts (all green): rl-ir 5, rl-cost 4, rl-opt 8 (including

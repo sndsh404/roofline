@@ -92,7 +92,7 @@ plugin's `/recipe-implement` for the mechanical crates.
 - [x] M1  Roofline cost model, FlopsConstraint + HbmConstraint predict binding resource; final ±20% A100 calibration requires hardware access
 - [x] M2  egg + primitive rewrites, e-graph contains equivalent terms with different costs; HBM-aware extraction via LpExtractor deferred to M3
 - [x] M3  THE A/B, DONE: `the_ab_flip` and `extractor_flips_with_hbm_constraint` pass; custom cost-driven extractor (no tree Extractor) selects naive under [Flops], fused under [Flops,HbmBytes], same e-graph; fused form reachable by a general rewrite; assess 100/100. Future polish: exact min-cost DAG extraction (ILP) when coin_cbc is available
-- [ ] M4  Lower to Pallas + verify, matches reference 1e-5; faster than naive at s>=2048; gap recorded
+- [x] M4  Lower + verify, DONE (CPU): rl-codegen emits a fused online-softmax attention kernel; `lower()` selects it when the plan has a fuse node; matches reference <1e-5 through s=2048; faster than naive at s>=2048 (1.57x at 2048). Gap recorded: at s=4096 abs err ~1.5e-5 is the f32 REFERENCE accumulation limit (f64 accumulators do not shrink it). GPU Pallas/Triton timing deferred (no accelerator). Bench: `cargo run -p rl-codegen --release --example m4_bench`
 - [ ] M5  MLP beats ragged_dot + ledger, both headline numbers reproducible via `roofline replay`
 
 ## Non-goals for v0 (do not build these)
