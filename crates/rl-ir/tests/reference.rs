@@ -57,18 +57,18 @@ const EXPECTED: [f32; 32] = [
 fn make_env() -> HashMap<String, TensorData> {
     let scale = 1.0_f32 / (D as f32).sqrt();
     HashMap::from([
-        ("Q".into(),     TensorData::new(vec![S, D], Q.to_vec())),
-        ("K".into(),     TensorData::new(vec![S, D], K.to_vec())),
-        ("V".into(),     TensorData::new(vec![S, D], V.to_vec())),
+        ("Q_sd".into(),  TensorData::new(vec![S, D], Q.to_vec())),
+        ("K_sd".into(),  TensorData::new(vec![S, D], K.to_vec())),
+        ("V_sd".into(),  TensorData::new(vec![S, D], V.to_vec())),
         ("scale".into(), TensorData::scalar(scale)),
     ])
 }
 
 fn make_shapes() -> HashMap<String, Vec<usize>> {
     HashMap::from([
-        ("Q".into(),     vec![S, D]),
-        ("K".into(),     vec![S, D]),
-        ("V".into(),     vec![S, D]),
+        ("Q_sd".into(),  vec![S, D]),
+        ("K_sd".into(),  vec![S, D]),
+        ("V_sd".into(),  vec![S, D]),
         ("scale".into(), vec![1]),
     ])
 }
@@ -101,9 +101,9 @@ fn hbm_contains_s_squared_term() {
     let d = 64usize;
     for &s in &[32usize, 64, 128, 256] {
         let shapes = HashMap::from([
-            ("Q".into(),     vec![s, d]),
-            ("K".into(),     vec![s, d]),
-            ("V".into(),     vec![s, d]),
+            ("Q_sd".into(),  vec![s, d]),
+            ("K_sd".into(),  vec![s, d]),
+            ("V_sd".into(),  vec![s, d]),
             ("scale".into(), vec![1]),
         ]);
         let (expr, root) = naive_attention_program();

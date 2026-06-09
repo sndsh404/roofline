@@ -192,9 +192,9 @@ fn account_node(
 /// Inputs: Q_sd, K_sd, V_sd, scale (scalar = 1/sqrt(d))
 pub fn naive_attention_program() -> (RecExpr<TensorLang>, Id) {
     let mut e = RecExpr::default();
-    let q  = e.add(TensorLang::Var("Q".into()));
-    let k  = e.add(TensorLang::Var("K".into()));
-    let v  = e.add(TensorLang::Var("V".into()));
+    let q  = e.add(TensorLang::Var("Q_sd".into()));
+    let k  = e.add(TensorLang::Var("K_sd".into()));
+    let v  = e.add(TensorLang::Var("V_sd".into()));
     let sc = e.add(TensorLang::Var("scale".into()));
     let kt      = e.add(TensorLang::Transpose([k]));
     let scores  = e.add(TensorLang::MatMul([q, kt]));     // [s,s]
@@ -208,9 +208,9 @@ pub fn naive_attention_program() -> (RecExpr<TensorLang>, Id) {
 /// Inputs: X_sf (token, in_features), W_up_fi (in, hidden), W_dn_io (hidden, in)
 pub fn naive_mlp_program() -> (RecExpr<TensorLang>, Id) {
     let mut e = RecExpr::default();
-    let x    = e.add(TensorLang::Var("X".into()));
-    let w_up = e.add(TensorLang::Var("W_up".into()));
-    let w_dn = e.add(TensorLang::Var("W_dn".into()));
+    let x    = e.add(TensorLang::Var("X_sf".into()));
+    let w_up = e.add(TensorLang::Var("W_up_fi".into()));
+    let w_dn = e.add(TensorLang::Var("W_dn_io".into()));
     let hidden = e.add(TensorLang::MatMul([x, w_up]));
     let out    = e.add(TensorLang::MatMul([hidden, w_dn]));
     (e, out)

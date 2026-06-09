@@ -9,9 +9,9 @@ fn main() {
     for &s in &[64usize, 128, 256, 512, 1024] {
         let d = 64usize;
         let shapes = HashMap::from([
-            ("Q".into(),     vec![s, d]),
-            ("K".into(),     vec![s, d]),
-            ("V".into(),     vec![s, d]),
+            ("Q_sd".into(),  vec![s, d]),
+            ("K_sd".into(),  vec![s, d]),
+            ("V_sd".into(),  vec![s, d]),
             ("scale".into(), vec![1usize]),
         ]);
         let (expr, root) = naive_attention_program();
