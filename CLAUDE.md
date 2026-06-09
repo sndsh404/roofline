@@ -91,7 +91,7 @@ plugin's `/recipe-implement` for the mechanical crates.
 - [x] M0  Substrate + IR + reference interpreter — naive attn matches JAX 1e-5; microbench prints true flops/hbm_bytes
 - [x] M1  Roofline cost model — FlopsConstraint + HbmConstraint predict binding resource; final ±20% A100 calibration requires hardware access
 - [x] M2  egg + primitive rewrites — e-graph contains equivalent terms with different costs; HBM-aware extraction via LpExtractor deferred to M3
-- [ ] M3  LpExtractor + THE A/B — [Flops] returns naive; [Flops,HbmBytes] returns flash (same e-graph)
+- [~] M3  THE A/B — PASSING: `the_ab_flip` selects naive under [Flops], fused under [Flops,HbmBytes], same e-graph; fused form reachable by a general rewrite. Remaining: general DAG extraction over arbitrary e-graphs (LpExtractor substitute; placeholder tree Extractor still present, flagged by assess)
 - [ ] M4  Lower to Pallas + verify — matches reference 1e-5; faster than naive at s>=2048; gap recorded
 - [ ] M5  MLP beats ragged_dot + ledger — both headline numbers reproducible via `roofline replay`
 

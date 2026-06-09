@@ -161,9 +161,24 @@ model was incomplete.*
   fused form wins.
 
 Same search, same e-graph, one extra constraint. That flip *is* the thesis made
-executable. The remaining M3 work is to wire the extractor to the cost model so this
-runs as a passing test; the pieces it needs (the shape analysis and the `fuse`
-primitive) are already built and described below.
+executable — and it now **runs as a passing test**, `the_ab_flip` in `rl-opt`:
+
+```rust
+let candidates = [naive, fused];                 // both reachable in one e-graph
+let flops_only = CostModel::new().add(FlopsConstraint::new(H100));
+let with_hbm   = flops_only.clone().add(HbmConstraint::new(H100));
+
+assert_eq!(select_plan(&candidates, &shapes, &flops_only), 0); // keeps naive
+assert_eq!(select_plan(&candidates, &shapes, &with_hbm),    1); // chooses fused
+```
+
+A companion test, `fused_form_is_reachable_by_rewrite`, proves the fused candidate
+is not hand-built: a general fusion rewrite (`(matmul (softmax ?x) ?v) => (fuse
+…)`) places it in the same e-class as the naive root during saturation. So the form
+is *reached* by the algebra and *selected* by the cost model — the two halves rule
+4 demands. The one piece still open is general DAG extraction over an arbitrary
+e-graph (the cost model currently selects among the reachable candidate plans); see
+§7 and the roadmap.
 
 ---
 
@@ -547,11 +562,12 @@ met and recorded.
 | **M0** | substrate, IR, reference interpreter | naive attention and MLP match a JAX/NumPy fixture to 1e-5; a microbench prints true flops/hbm | **done** (err 2.98e-8) |
 | **M1** | roofline cost model | predict the naive case and print the binding resource; calibrate vs measured within tolerance | **done** for binding-resource; wall-clock calibration deferred (needs accelerator) |
 | **M2** | egg + primitive rewrites | after saturation the e-graph provably contains equivalent forms | **done** (assoc, transpose, scale distribution) |
-| **M3** | cost-driven extraction + the A/B | under `[Flops]` extract naive; under `[Flops, HbmBytes]` extract fused — same e-graph | **in progress**: shape analysis done, fuse primitive done; extractor + flip remain |
+| **M3** | cost-driven extraction + the A/B | under `[Flops]` extract naive; under `[Flops, HbmBytes]` extract fused — same e-graph | **A/B flip passing** (`the_ab_flip`); general DAG extraction over arbitrary e-graphs is the remaining polish |
 | **M4** | lower to a real kernel + verify | kernel matches reference to 1e-5, beats naive at seq ≥ 2048; record predicted-vs-measured gap | not started |
 | **M5** | beat `ragged_dot` + the ledger | fused MLP beats `jax.lax.ragged_dot` for F>D; both headline numbers reproducible via `roofline replay` | not started |
 
-Current test counts (all green): rl-ir 5, rl-cost 4, rl-opt 6.
+Current test counts (all green): rl-ir 5, rl-cost 4, rl-opt 8 (including
+`the_ab_flip` and `fused_form_is_reachable_by_rewrite`).
 
 The ordering is dependency-strict. M0 (the unglamorous reference interpreter) comes
 first because it makes every later number honest. M1 must calibrate before M3 is
