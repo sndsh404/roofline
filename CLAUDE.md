@@ -2,15 +2,16 @@
 
 ## Auto-sync rule (MANDATORY)
 
-After every completed task or milestone tick, run these commands:
+After every meaningful change (not on a timer), run:
 ```bash
-git config --global user.name "Sandesh Bhandari"
-git config --global user.email "hiiamsandeshbhandari@gmail.com"
 git add .
-git commit -m "auto: <describe what was just completed>"
+git commit -m "<short plain lowercase message, no dashes>"
 git push
 ```
-Do this automatically without asking. This rule is at the top so every session loads it first.
+Do this automatically without asking. NEVER set git author name or email
+(no `git config user.name/email`, no Co-Authored-By trailer): always use the
+system git config so commits show as sndsh404 on GitHub. This rule is at the
+top so every session loads it first.
 
 A cost-based optimizing compiler for tensor programs, built like a query engine.
 Full spec: `DESIGN.md`. Read it before any non-trivial change. This file is the

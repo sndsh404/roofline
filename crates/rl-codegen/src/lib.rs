@@ -18,19 +18,28 @@ use egg::{Id, RecExpr};
 use rl_ir::{eval, TensorData, TensorLang};
 
 /// Which kernel a plan lowers to. A plan that contains a `fuse` node lowers to
-/// the fused attention kernel; anything else falls back to the reference
+/// the matching fused kernel; anything else falls back to the reference
 /// interpreter (correct, unoptimised).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kernel {
     FusedAttention,
+    FusedMlp,
     Reference,
 }
 
 /// Inspect an extracted plan and decide which kernel to emit. The optimizer's
-/// decision to fuse (a `Fuse` node in the plan) is what selects the fast path.
+/// decision to fuse (a `Fuse` node in the plan) is what selects the fast path;
+/// the producer inside the fused region picks the kernel shape (softmax chain
+/// is attention, relu chain is the MLP).
 pub fn lower(expr: &RecExpr<TensorLang>) -> Kernel {
-    if expr.as_ref().iter().any(|n| matches!(n, TensorLang::Fuse(_))) {
+    let nodes = expr.as_ref();
+    if !nodes.iter().any(|n| matches!(n, TensorLang::Fuse(_))) {
+        return Kernel::Reference;
+    }
+    if nodes.iter().any(|n| matches!(n, TensorLang::Softmax(_))) {
         Kernel::FusedAttention
+    } else if nodes.iter().any(|n| matches!(n, TensorLang::Relu(_))) {
+        Kernel::FusedMlp
     } else {
         Kernel::Reference
     }
@@ -52,6 +61,7 @@ pub fn lower_and_run(
             let scale = env["scale"].data[0];
             fused_attention(q, k, v, scale)
         }
+        Kernel::FusedMlp => fused_mlp(&env["X_sd"], &env["W_up_df"], &env["W_dn_fd"]),
         Kernel::Reference => eval(expr, root, env),
     }
 }
@@ -108,6 +118,53 @@ pub fn fused_attention(q: &TensorData, k: &TensorData, v: &TensorData, scale: f3
     TensorData::new(vec![s, dv], out)
 }
 
+/// Fused MLP: Y_sd = relu(X_sd W_up_df) W_dn_fd computed one token row at a
+/// time. The hidden activations h_f for the current row live in one length-f
+/// buffer (SRAM, in the cost model's terms) and are consumed immediately by the
+/// down projection, so the s by f hidden matrix is never materialised. That is
+/// exactly the HBM saving the optimizer's fused plan claims.
+///
+/// Deliberately no extra tricks (no skipping relu zeros, no blocking): the
+/// arithmetic and its order are identical to the reference interpreter's, so
+/// the comparison isolates fusion, not kernel tuning.
+pub fn fused_mlp(x: &TensorData, w_up: &TensorData, w_dn: &TensorData) -> TensorData {
+    assert_eq!(x.shape.len(), 2, "X must be 2-D");
+    let (s, d) = (x.shape[0], x.shape[1]);
+    assert_eq!(w_up.shape[0], d, "W_up rows must match X cols");
+    let f = w_up.shape[1];
+    assert_eq!(w_dn.shape[0], f, "W_dn rows must match W_up cols");
+    let d_out = w_dn.shape[1];
+
+    let mut out = vec![0.0f32; s * d_out];
+    let mut h_f = vec![0.0f32; f];
+
+    for i in 0..s {
+        for h in h_f.iter_mut() {
+            *h = 0.0;
+        }
+        let xi = &x.data[i * d..(i + 1) * d];
+        for l in 0..d {
+            let x_il = xi[l];
+            let w_row = &w_up.data[l * f..(l + 1) * f];
+            for j in 0..f {
+                h_f[j] += x_il * w_row[j];
+            }
+        }
+        for h in h_f.iter_mut() {
+            *h = h.max(0.0);
+        }
+        let yi = &mut out[i * d_out..(i + 1) * d_out];
+        for j in 0..f {
+            let h_ij = h_f[j];
+            let w_row = &w_dn.data[j * d_out..(j + 1) * d_out];
+            for t in 0..d_out {
+                yi[t] += h_ij * w_row[t];
+            }
+        }
+    }
+    TensorData::new(vec![s, d_out], out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +212,41 @@ mod tests {
         let r = Id::from(fused.as_ref().len() - 1);
         fused.add(TensorLang::Fuse([r]));
         assert_eq!(lower(&fused), Kernel::FusedAttention);
+    }
+
+    fn mlp_env(s: usize, d: usize, f: usize) -> HashMap<String, TensorData> {
+        let gen = |seed: usize, n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 1103515245 + seed) % 1000) as f32) / 500.0 - 1.0)
+                .collect()
+        };
+        HashMap::from([
+            ("X_sd".to_string(), TensorData::new(vec![s, d], gen(1, s * d))),
+            ("W_up_df".to_string(), TensorData::new(vec![d, f], gen(2, d * f))),
+            ("W_dn_fd".to_string(), TensorData::new(vec![f, d], gen(3, f * d))),
+        ])
+    }
+
+    #[test]
+    fn fused_mlp_matches_reference_across_shapes() {
+        // The hard gate for the M5 kernel: match the reference interpreter to
+        // 1e-5 across a shape sweep covering f < d, f = d, and f > d.
+        let (prog, root) = rl_ir::naive_mlp_program();
+        for &(s, d, f) in &[(64, 32, 16), (64, 32, 32), (128, 32, 128), (256, 64, 512), (200, 48, 384)] {
+            let e = mlp_env(s, d, f);
+            let reference = eval(&prog, root, &e);
+            let fused = fused_mlp(&e["X_sd"], &e["W_up_df"], &e["W_dn_fd"]);
+            let err = max_abs_err(&reference, &fused);
+            assert!(err < 1e-5, "fused MLP err {err} at s={s} d={d} f={f} exceeds 1e-5");
+        }
+    }
+
+    #[test]
+    fn lower_picks_fused_mlp_when_plan_has_fuse_and_relu() {
+        let (naive, _) = rl_ir::naive_mlp_program();
+        assert_eq!(lower(&naive), Kernel::Reference);
+
+        let (fused, _) = rl_ir::fused_mlp_program();
+        assert_eq!(lower(&fused), Kernel::FusedMlp);
     }
 }

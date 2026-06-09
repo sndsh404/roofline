@@ -45,14 +45,21 @@ fn scale_distrib<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
 }
 
 fn fusion<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
-    // General producer/consumer fusion: a softmax consumed immediately by a matmul
-    // can run as one kernel, so its s×s output need not spill to HBM. This is NOT
-    // a canned "attention => flash" rule (CLAUDE.md rule 4), it is the general
-    // "a producer consumed at once need not spill" identity, which happens to fire
-    // on attention. Applied to the naive root it makes the fused form reachable in
-    // the same e-class; the cost model decides whether to take it.
-    vec![rw!("fuse-softmax-matmul";
-        "(matmul (softmax ?x) ?v)" => "(fuse (matmul (softmax ?x) ?v))")]
+    // General producer/consumer fusion: a producer consumed immediately by a
+    // matmul can run as one kernel, so its intermediate output need not spill to
+    // HBM. These are NOT canned "attention => flash" or "mlp => fused" rules
+    // (CLAUDE.md rule 4); each is the general "a producer consumed at once need
+    // not spill" identity for one producer kind. On attention the softmax rule
+    // fires (the s×s probabilities stay in SRAM); on the MLP the relu rule fires
+    // (the s×f hidden activations stay in SRAM). Applied to a program's root they
+    // make the fused form reachable in the same e-class; the cost model decides
+    // whether to take it.
+    vec![
+        rw!("fuse-softmax-matmul";
+            "(matmul (softmax ?x) ?v)" => "(fuse (matmul (softmax ?x) ?v))"),
+        rw!("fuse-relu-matmul";
+            "(matmul (relu ?x) ?v)" => "(fuse (matmul (relu ?x) ?v))"),
+    ]
 }
 
 pub fn all_rewrites<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
@@ -112,6 +119,7 @@ fn node_flops(egraph: &EGraph<TensorLang, ShapeAnalysis>, enode: &TensorLang) ->
             out.iter().product::<usize>() as u64
         }
         TensorLang::Softmax([a]) => 4 * sh(a).iter().product::<usize>() as u64,
+        TensorLang::Relu([a]) => sh(a).iter().product::<usize>() as u64,
         _ => 0,
     }
 }
@@ -355,6 +363,7 @@ impl Analysis<TensorLang> for ShapeAnalysis {
                 }
             }
             TensorLang::Softmax([a]) => child(a),
+            TensorLang::Relu([a]) => child(a),
             TensorLang::Fuse([a]) => child(a),
         }
     }
@@ -494,6 +503,56 @@ mod tests {
 
         assert_eq!(pick_flops, 0, "with [Flops] only, the optimizer should keep naive");
         assert_eq!(pick_hbm, 1, "with [Flops, HbmBytes], the optimizer should choose fused");
+    }
+
+    fn mlp_shapes(s: usize, d: usize, f: usize) -> HashMap<String, Vec<usize>> {
+        HashMap::from([
+            ("X_sd".into(), vec![s, d]),
+            ("W_up_df".into(), vec![d, f]),
+            ("W_dn_fd".into(), vec![f, d]),
+        ])
+    }
+
+    #[test]
+    fn mlp_fused_form_is_reachable_by_rewrite() {
+        // Rule-4 honesty for M5: the fused MLP form must enter the naive
+        // program's e-class via the general relu producer fusion rewrite, not by
+        // being hand-built.
+        use rl_ir::{fused_mlp_program, naive_mlp_program};
+        let (naive, _) = naive_mlp_program();
+        let (fused, _) = fused_mlp_program();
+        assert!(
+            fused_form_reachable(&naive, &fused, mlp_shapes(64, 16, 64)),
+            "relu fusion rewrite should make the fused MLP form reachable"
+        );
+    }
+
+    #[test]
+    fn mlp_extractor_flips_with_hbm_constraint() {
+        // The M5 A/B at the extractor level. With only FLOPs modelled the cost
+        // model cannot see the s by f hidden round-trip, so it keeps the unfused
+        // plan; with HbmBytes it fuses. Same e-graph, one extra constraint.
+        use rl_cost::{CostModel, FlopsConstraint, HbmConstraint, H100};
+        use rl_ir::naive_mlp_program;
+        let (expr, _) = naive_mlp_program();
+        let shapes = mlp_shapes(2048, 128, 1024); // f > d: HBM dominated by H_sf
+        let runner = saturate_shaped(&expr, shapes.clone());
+        let root = runner.egraph.lookup_expr(&expr).expect("root in egraph");
+
+        let flops_only = CostModel::new().add(FlopsConstraint::new(H100));
+        let with_hbm = CostModel::new()
+            .add(FlopsConstraint::new(H100))
+            .add(HbmConstraint::new(H100));
+
+        let plan_flops = extract_cost_driven(&runner.egraph, root, &flops_only);
+        let plan_hbm = extract_cost_driven(&runner.egraph, root, &with_hbm);
+
+        assert!(!contains_fuse(&plan_flops), "FLOPs-only MLP plan should not fuse");
+        assert!(contains_fuse(&plan_hbm), "HBM-aware MLP plan should fuse");
+
+        let h_flops = account_expr(&plan_flops, &shapes).hbm_bytes;
+        let h_hbm = account_expr(&plan_hbm, &shapes).hbm_bytes;
+        assert!(h_hbm < h_flops, "fused MLP plan {h_hbm} should move fewer bytes than {h_flops}");
     }
 
     #[test]

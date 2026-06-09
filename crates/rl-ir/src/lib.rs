@@ -16,6 +16,12 @@ define_language! {
         "emul" = EMul([Id; 2]),
         // Numerically stable softmax along the last axis.
         "softmax" = Softmax([Id; 1]),
+        // Elementwise max(x, 0). The MLP's nonlinearity. Load-bearing for M5:
+        // without it the two-layer MLP is linear and the e-graph correctly
+        // collapses (X Wup) Wdn into X (Wup Wdn) by associativity, leaving
+        // nothing to fuse. The relu blocks that collapse, exactly as in a real
+        // network.
+        "relu" = Relu([Id; 1]),
         // Fusion boundary: the wrapped subgraph runs as one kernel and its
         // internal intermediates are NOT spilled to HBM. Value-identity (it does
         // not change the math), so the interpreter treats it as a pass-through.
@@ -76,6 +82,7 @@ pub fn eval(
             emul_broadcast(&ta, &tb)
         }
         TensorLang::Softmax([a]) => softmax_last(&eval(expr, a, env)),
+        TensorLang::Relu([a]) => relu_elementwise(&eval(expr, a, env)),
         // Fusion is a scheduling annotation; it does not change the value.
         TensorLang::Fuse([a]) => eval(expr, a, env),
     }
@@ -114,6 +121,7 @@ pub fn infer_shape(
             }
         }
         TensorLang::Softmax([a]) => infer_shape(expr, a, shapes),
+        TensorLang::Relu([a]) => infer_shape(expr, a, shapes),
         TensorLang::Fuse([a]) => infer_shape(expr, a, shapes),
     }
 }
@@ -195,6 +203,14 @@ fn account_node(
             acc.hbm_bytes += (prefix * last * 4) as u64;
             sa
         }
+        TensorLang::Relu([a]) => {
+            let sa = account_node(expr, a, shapes, acc);
+            let elems: usize = sa.iter().product();
+            // One compare per element; the materialized result is written back.
+            acc.flops += elems as u64;
+            acc.hbm_bytes += (elems * 4) as u64;
+            sa
+        }
         TensorLang::Fuse([a]) => {
             // The fused region computes all the same flops, but only its boundary
             // inputs (distinct leaves) and final output touch HBM. Internal
@@ -252,6 +268,11 @@ fn fused_walk(
             *flops += 4 * sa.iter().product::<usize>() as u64;
             sa
         }
+        TensorLang::Relu([a]) => {
+            let sa = fused_walk(expr, a, shapes, flops, leaves);
+            *flops += sa.iter().product::<usize>() as u64;
+            sa
+        }
         TensorLang::Fuse([a]) => fused_walk(expr, a, shapes, flops, leaves),
     }
 }
@@ -295,16 +316,37 @@ pub fn fused_attention_program() -> (RecExpr<TensorLang>, Id) {
     (e, fused)
 }
 
-/// Two-layer MLP: down(up(x))  (no activation in M0)
-/// Inputs: X_sf (token, in_features), W_up_fi (in, hidden), W_dn_io (hidden, in)
+/// Two-layer MLP with relu: Y_sd = relu(X_sd W_up_df) W_dn_fd.
+/// Shape suffixes follow DESIGN's F > D nomenclature: d is the model width,
+/// f is the hidden width, so X_sd is [s, d], W_up_df is [d, f], W_dn_fd is
+/// [f, d] and the M5 regime of interest is f > d. The relu is what keeps the
+/// program two matmuls: without it associativity legally collapses the chain
+/// into X (W_up W_dn) and the right optimization is the collapse, not fusion.
 pub fn naive_mlp_program() -> (RecExpr<TensorLang>, Id) {
     let mut e = RecExpr::default();
-    let x    = e.add(TensorLang::Var("X_sf".into()));
-    let w_up = e.add(TensorLang::Var("W_up_fi".into()));
-    let w_dn = e.add(TensorLang::Var("W_dn_io".into()));
-    let hidden = e.add(TensorLang::MatMul([x, w_up]));
-    let out    = e.add(TensorLang::MatMul([hidden, w_dn]));
+    let x    = e.add(TensorLang::Var("X_sd".into()));
+    let w_up = e.add(TensorLang::Var("W_up_df".into()));
+    let w_dn = e.add(TensorLang::Var("W_dn_fd".into()));
+    let h_sf = e.add(TensorLang::MatMul([x, w_up]));
+    let a_sf = e.add(TensorLang::Relu([h_sf]));
+    let out  = e.add(TensorLang::MatMul([a_sf, w_dn]));
     (e, out)
+}
+
+/// The MLP with the whole up/relu/down chain fused: the s by f hidden
+/// activations never spill to HBM. Same value as `naive_mlp_program` (fuse is
+/// identity under eval); the accountant charges HBM only for X, the two
+/// weights, and Y. This is the form M5 lowers to a streaming kernel.
+pub fn fused_mlp_program() -> (RecExpr<TensorLang>, Id) {
+    let mut e = RecExpr::default();
+    let x    = e.add(TensorLang::Var("X_sd".into()));
+    let w_up = e.add(TensorLang::Var("W_up_df".into()));
+    let w_dn = e.add(TensorLang::Var("W_dn_fd".into()));
+    let h_sf = e.add(TensorLang::MatMul([x, w_up]));
+    let a_sf = e.add(TensorLang::Relu([h_sf]));
+    let out  = e.add(TensorLang::MatMul([a_sf, w_dn]));
+    let fused = e.add(TensorLang::Fuse([out]));
+    (e, fused)
 }
 
 // ── Primitive tensor ops ──────────────────────────────────────────────────────
@@ -353,6 +395,10 @@ fn emul_broadcast(a: &TensorData, b: &TensorData) -> TensorData {
             a.data.iter().zip(b.data.iter()).map(|(x, y)| x * y).collect(),
         )
     }
+}
+
+fn relu_elementwise(a: &TensorData) -> TensorData {
+    TensorData::new(a.shape.clone(), a.data.iter().map(|x| x.max(0.0)).collect())
 }
 
 fn softmax_last(a: &TensorData) -> TensorData {

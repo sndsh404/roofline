@@ -5,7 +5,10 @@
 
 use std::collections::HashMap;
 
-use rl_ir::{account, eval, fused_attention_program, naive_attention_program, TensorData};
+use rl_ir::{
+    account, eval, fused_attention_program, fused_mlp_program, naive_attention_program,
+    naive_mlp_program, TensorData,
+};
 
 fn attn_env(s: usize, d: usize) -> HashMap<String, TensorData> {
     // Deterministic pseudo-random inputs; values do not matter, only that naive
@@ -81,5 +84,78 @@ fn fused_attention_cuts_hbm() {
         na.hbm_bytes - fa.hbm_bytes
     );
     // Arithmetic is unchanged by fusion.
+    assert_eq!(na.flops, fa.flops, "fusion must not change flops");
+}
+
+// ── The same contract for the M5 MLP: relu(X_sd W_up_df) W_dn_fd ─────────────
+
+fn mlp_env(s: usize, d: usize, f: usize) -> HashMap<String, TensorData> {
+    let mut env = HashMap::new();
+    let gen = |seed: usize, n: usize| -> Vec<f32> {
+        (0..n).map(|i| (((i * 2654435761 + seed) % 1000) as f32) / 500.0 - 1.0).collect()
+    };
+    env.insert("X_sd".into(), TensorData::new(vec![s, d], gen(1, s * d)));
+    env.insert("W_up_df".into(), TensorData::new(vec![d, f], gen(2, d * f)));
+    env.insert("W_dn_fd".into(), TensorData::new(vec![f, d], gen(3, f * d)));
+    env
+}
+
+fn mlp_shapes(s: usize, d: usize, f: usize) -> HashMap<String, Vec<usize>> {
+    HashMap::from([
+        ("X_sd".into(), vec![s, d]),
+        ("W_up_df".into(), vec![d, f]),
+        ("W_dn_fd".into(), vec![f, d]),
+    ])
+}
+
+#[test]
+fn fused_mlp_matches_naive_numerically() {
+    let (s, d, f) = (32, 8, 24); // f > d, the M5 regime
+    let env = mlp_env(s, d, f);
+
+    let (naive, naive_root) = naive_mlp_program();
+    let (fused, fused_root) = fused_mlp_program();
+
+    let a = eval(&naive, naive_root, &env);
+    let b = eval(&fused, fused_root, &env);
+
+    assert_eq!(a.shape, b.shape, "fused MLP output shape must match naive");
+    let max_err = a
+        .data
+        .iter()
+        .zip(b.data.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_err < 1e-5, "fused vs naive MLP max abs err {max_err} exceeds 1e-5");
+}
+
+#[test]
+fn fused_mlp_cuts_hbm() {
+    // For f > d the naive plan's HBM is dominated by the s by f hidden
+    // activations, written by the up matmul, rewritten by relu, read by the
+    // down matmul. Fusion keeps them in SRAM.
+    let (s, d, f) = (256, 32, 256);
+    let shapes = mlp_shapes(s, d, f);
+
+    let (naive, naive_root) = naive_mlp_program();
+    let (fused, fused_root) = fused_mlp_program();
+
+    let na = account(&naive, naive_root, &shapes);
+    let fa = account(&fused, fused_root, &shapes);
+
+    assert!(
+        fa.hbm_bytes < na.hbm_bytes,
+        "fused MLP HBM {} should be < naive HBM {}",
+        fa.hbm_bytes,
+        na.hbm_bytes
+    );
+    // Fusion should save at least one full s by f hidden materialization.
+    let one_sf = (s * f * 4) as u64;
+    assert!(
+        na.hbm_bytes - fa.hbm_bytes >= one_sf,
+        "MLP fusion should save at least one s*f tile ({} bytes); saved {}",
+        one_sf,
+        na.hbm_bytes - fa.hbm_bytes
+    );
     assert_eq!(na.flops, fa.flops, "fusion must not change flops");
 }
