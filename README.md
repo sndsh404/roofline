@@ -61,10 +61,10 @@ Here is the key fact that makes optimization possible: **the same mathematical
 result can be computed in many different ways**, and they cost wildly different
 amounts on real hardware. Examples:
 
-- `(A · B) · C` equals `A · (B · C)` — same answer, different amount of work
+- `(A · B) · C` equals `A · (B · C)`, same answer, different amount of work
   depending on the matrix sizes.
 - You can compute the whole `scores = Q · Kᵀ` matrix, store it, then read it back
-  to softmax it — or you can compute it in tiles and never store the whole thing.
+  to softmax it, or you can compute it in tiles and never store the whole thing.
 - You can keep an intermediate in fast memory and consume it immediately, or you
   can write it out to slow memory and read it back later.
 
@@ -74,14 +74,14 @@ game.
 
 ### Why "the bottleneck is not the math"
 
-The instinct is to count arithmetic — floating point operations, FLOPs — and
+The instinct is to count arithmetic, floating point operations, FLOPs, and
 assume fewer FLOPs means faster. On modern accelerators this is usually wrong. A
 GPU can do hundreds of trillions of FLOPs per second, but moving data between its
 big-but-slow memory (HBM) and its small-but-fast memory (SRAM) is comparatively
 glacial. Many real kernels spend their time **waiting for memory**, not computing.
 
 The standard way to see this is the **roofline**. Plot a program's *arithmetic
-intensity* — how many FLOPs it does per byte it moves — against the performance it
+intensity*, how many FLOPs it does per byte it moves, against the performance it
 can achieve. Below a certain intensity (the "ridge point") you are limited by
 memory bandwidth; above it you are limited by compute.
 
@@ -89,7 +89,7 @@ memory bandwidth; above it you are limited by compute.
 
 *the roofline. low arithmetic intensity (few flops per byte moved) means HBM
 bandwidth is the wall; high intensity means compute is. naive attention sits far
-to the left at around 9 flops per byte, deep in the bandwidth-bound region — which
+to the left at around 9 flops per byte, deep in the bandwidth-bound region, which
 is exactly what fusion attacks by cutting the bytes.*
 
 This is why Flash Attention was a breakthrough even though it does *the same
@@ -132,7 +132,7 @@ This forces a discipline that is the soul of the project:
 > missing a constraint,"** never **"the search failed."**
 
 If the optimizer is wrong, you do not patch the search with a special case. You ask
-which physical constraint it failed to model, and you add it — a new
+which physical constraint it failed to model, and you add it, a new
 `impl Constraint`, usually about twenty lines. The failure is named and localized
 by construction. This is what makes the system extensible instead of a pile of
 heuristics, and it is the reason the cost model, not the search, is where the
@@ -161,7 +161,7 @@ model was incomplete.*
   fused form wins.
 
 Same search, same e-graph, one extra constraint. That flip *is* the thesis made
-executable — and it now **runs as a passing test**, `the_ab_flip` in `rl-opt`:
+executable, and it now **runs as a passing test**, `the_ab_flip` in `rl-opt`:
 
 ```rust
 let candidates = [naive, fused];                 // both reachable in one e-graph
@@ -175,7 +175,7 @@ assert_eq!(select_plan(&candidates, &shapes, &with_hbm),    1); // chooses fused
 A companion test, `fused_form_is_reachable_by_rewrite`, proves the fused candidate
 is not hand-built: a general fusion rewrite (`(matmul (softmax ?x) ?v) => (fuse
 …)`) places it in the same e-class as the naive root during saturation. So the form
-is *reached* by the algebra and *selected* by the cost model — the two halves rule
+is *reached* by the algebra and *selected* by the cost model, the two halves rule
 4 demands. The one piece still open is general DAG extraction over an arbitrary
 e-graph (the cost model currently selects among the reachable candidate plans); see
 §7 and the roadmap.
@@ -197,7 +197,7 @@ plan is lowered to a kernel and recorded so it reproduces.*
 | crate | role | status |
 |---|---|---|
 | `rl-ir` | the tensor IR (an `egg` language), a naive reference interpreter that *defines* correctness, and the accountant that measures true FLOPs and HBM bytes | working |
-| `rl-cost` | `Device`, the `Constraint` trait, and the roofline cost model — the core idea | working |
+| `rl-cost` | `Device`, the `Constraint` trait, and the roofline cost model, the core idea | working |
 | `rl-opt` | the `egg` e-graph, the rewrite rules, the shape analysis, and extraction | working (extraction is the M3 frontier) |
 | `rl-codegen` | lowering a chosen physical plan to a Pallas/Triton kernel | stub |
 | `rl-ledger` | a write-ahead-log + MVCC store for preregistered, replayable results | stub |
@@ -220,7 +220,7 @@ means, and what the true resource costs are. Every later claim stands on it.
 A program is a term in a small language defined with the `egg` library's
 `define_language!` macro. `egg` is an e-graph library (explained fully in §7); the
 important part now is that defining the IR as an `egg` language means the same data
-structure the interpreter walks is the one the optimizer rewrites — no translation
+structure the interpreter walks is the one the optimizer rewrites, no translation
 layer, no drift.
 
 ```rust
@@ -236,7 +236,7 @@ define_language! {
 }
 ```
 
-Each `Id` is a reference to a child node. The set is deliberately tiny — just enough
+Each `Id` is a reference to a child node. The set is deliberately tiny, just enough
 to express naive attention and a two-layer MLP. That is a trade-off: a small
 language is easy to reason about and easy to give a correct interpreter, at the cost
 of not expressing arbitrary programs yet. v0 does not need generality; it needs one
@@ -255,7 +255,7 @@ pub fn naive_mlp_program() -> (RecExpr<TensorLang>, Id) { ... }
 ### The reference interpreter defines truth
 
 The interpreter evaluates a `TensorLang` term on plain `Vec<f32>` tensors with the
-most obvious, naive implementation possible — triple-loop matmul, straightforward
+most obvious, naive implementation possible, triple-loop matmul, straightforward
 softmax. It is not fast and is not meant to be. Its job is to be *so obviously
 correct* that it can serve as the oracle: any optimized kernel the system ever
 produces must match this interpreter to `1e-5`. A fast wrong kernel is worth
@@ -300,7 +300,7 @@ reads its inputs from HBM and writes its output back. Per node:
 - `Transpose`: 0 FLOPs, writes the transposed copy.
 - `Var` (input): reads `numel·4` bytes from HBM.
 
-This is deliberately the *naive, pessimistic* model — it is the baseline the whole
+This is deliberately the *naive, pessimistic* model, it is the baseline the whole
 project exists to beat. It is honest about being crude: real hardware overlaps
 compute and memory, and not every intermediate truly spills. Calibrating this model
 against measured wall-clock is M1's job, and the gap between predicted and measured
@@ -309,7 +309,7 @@ intentional: a simple, transparent model you can fully reason about, with its
 inaccuracy made explicit and turned into future work, beats a complicated model you
 cannot audit.
 
-`Account::intensity()` returns `flops / hbm_bytes` — the arithmetic intensity that
+`Account::intensity()` returns `flops / hbm_bytes`, the arithmetic intensity that
 places a program on the roofline. For naive attention it comes out around 9–11
 flops/byte regardless of sequence length, which is exactly why attention is
 bandwidth-bound: that number sits far below any accelerator's ridge point (~156 for
@@ -319,7 +319,7 @@ A100, ~295 for H100).
 
 ## 6. rl-cost: the roofline cost model
 
-This crate is the core idea in code. It is small, and that smallness is the point —
+This crate is the core idea in code. It is small, and that smallness is the point
 the value is in the shape of the abstraction, not the volume.
 
 ### Device
@@ -356,7 +356,7 @@ struct HbmConstraint   { device: Device }   // hbm_bytes / hbm_bandwidth
 
 `FlopsConstraint` returns `flops / peak_flops`: the time if compute were the only
 limit. `HbmConstraint` returns `hbm_bytes / hbm_bandwidth`: the time if bandwidth
-were the only limit. Each is a *lower bound* — the resource cannot go faster than
+were the only limit. Each is a *lower bound*, the resource cannot go faster than
 its peak, so the op cannot finish sooner than this.
 
 ### The cost model: slowest resource wins
@@ -403,7 +403,7 @@ the most conceptually dense, so this section builds the e-graph idea from scratc
 ### What an e-graph is, and why
 
 Suppose you have a rule `(A·B)·C = A·(B·C)`. If you rewrite a program by *replacing*
-the left side with the right side, you have thrown away the original — and maybe the
+the left side with the right side, you have thrown away the original, and maybe the
 original was better. You want to keep *both* and decide later. Do that across many
 rules and you get a combinatorial explosion of equivalent programs to store.
 
@@ -418,7 +418,7 @@ space of programs reachable by your rules.
 This is exactly the structure the optimizer needs: generate every equivalent form,
 then extract the cheapest. `egg` is the Rust library that provides it, and
 `risinglight` (an educational analytic database) demonstrates using `egg` for query
-optimization — the direct template for using it here on tensors.
+optimization, the direct template for using it here on tensors.
 
 ### The rewrite rules
 
@@ -485,11 +485,11 @@ built: `cargo test -p rl-opt` confirms the attention output e-class carries shap
 Once the e-graph is saturated, **extraction** chooses one concrete program: pick one
 node per e-class to minimize total cost. There is a subtlety that the project's rule
 6 calls out in advance. The default `egg` extractor computes *tree* cost, which
-double-counts shared subexpressions — and attention reuses `Q`, `K`, `V` heavily, so
+double-counts shared subexpressions, and attention reuses `Q`, `K`, `V` heavily, so
 tree cost would badly misprice it. This is the exact wall the Tensat project hit.
 
 The correct tool is a **DAG-aware** extractor that counts each shared tensor once.
-`egg::LpExtractor` does this with integer linear programming — but it depends on the
+`egg::LpExtractor` does this with integer linear programming, but it depends on the
 `coin_cbc` solver, a C library that is not available on this machine. So the plan
 (recorded in the checkpoints) is a custom memoized DAG extractor that reads the
 shape analysis to compute real per-e-class bytes and counts each materialized
@@ -516,7 +516,7 @@ probabilities through HBM (four arrows down to HBM); the fused plan keeps them i
 SRAM and only the inputs and the final output touch HBM (two arrows). the value is
 identical, the HBM bill is not.*
 
-The `fuse` node models this. It is **value-identity** — wrapping a subgraph in
+The `fuse` node models this. It is **value-identity**, wrapping a subgraph in
 `fuse` does not change the result, so the interpreter treats it as a pass-through and
 the 1e-5 numerics gate still holds. What changes is accounting: a fused region is
 charged HBM only for its boundary inputs and final output, never its internal
@@ -525,15 +525,15 @@ intermediates.
 ```rust
 TensorLang::Fuse([a]) => {
     // sum all flops in the subtree, but count HBM only for distinct leaf inputs
-    // and the final output — internal intermediates stay in SRAM.
+    // and the final output, internal intermediates stay in SRAM.
     let (flops, leaf_bytes, out_shape) = fused_walk(expr, a, shapes);
     acc.flops     += flops;
     acc.hbm_bytes += leaf_bytes + out_bytes(out_shape);
 }
 ```
 
-Crucially this is a **general** primitive — "a producer consumed immediately need not
-spill" — not an attention special case. The same node fuses the MLP up/down
+Crucially this is a **general** primitive, "a producer consumed immediately need not
+spill", not an attention special case. The same node fuses the MLP up/down
 projection in M5. That generality is what keeps it honest under rule 4.
 
 This is verified by `cargo test -p rl-ir --test fuse`:
@@ -543,7 +543,7 @@ This is verified by `cargo test -p rl-ir --test fuse`:
   `seq×seq` tile, while FLOPs stay exactly equal.
 
 **The honest caveat, stated loudly:** fusing the whole `seq×seq` region assumes it
-fits in SRAM. Real Flash Attention works precisely because it *tiles* — it keeps only
+fits in SRAM. Real Flash Attention works precisely because it *tiles*, it keeps only
 a small block in SRAM at a time. The capacity limit that forces tiling is not yet
 modelled. Adding an **SRAM-capacity constraint** that forces tiling for large `seq`
 is the next `impl Constraint`, and it is the perfect example of the whole thesis: a
@@ -562,7 +562,7 @@ met and recorded.
 | **M0** | substrate, IR, reference interpreter | naive attention and MLP match a JAX/NumPy fixture to 1e-5; a microbench prints true flops/hbm | **done** (err 2.98e-8) |
 | **M1** | roofline cost model | predict the naive case and print the binding resource; calibrate vs measured within tolerance | **done** for binding-resource; wall-clock calibration deferred (needs accelerator) |
 | **M2** | egg + primitive rewrites | after saturation the e-graph provably contains equivalent forms | **done** (assoc, transpose, scale distribution) |
-| **M3** | cost-driven extraction + the A/B | under `[Flops]` extract naive; under `[Flops, HbmBytes]` extract fused — same e-graph | **A/B flip passing** (`the_ab_flip`); general DAG extraction over arbitrary e-graphs is the remaining polish |
+| **M3** | cost-driven extraction + the A/B | under `[Flops]` extract naive; under `[Flops, HbmBytes]` extract fused, same e-graph | **done**: `the_ab_flip` and `extractor_flips_with_hbm_constraint` pass; a custom DAG-honest extractor (no tree `Extractor`) drives the flip; exact ILP extraction is future polish |
 | **M4** | lower to a real kernel + verify | kernel matches reference to 1e-5, beats naive at seq ≥ 2048; record predicted-vs-measured gap | not started |
 | **M5** | beat `ragged_dot` + the ledger | fused MLP beats `jax.lax.ragged_dot` for F>D; both headline numbers reproducible via `roofline replay` | not started |
 
@@ -571,7 +571,7 @@ Current test counts (all green): rl-ir 5, rl-cost 4, rl-opt 8 (including
 
 The ordering is dependency-strict. M0 (the unglamorous reference interpreter) comes
 first because it makes every later number honest. M1 must calibrate before M3 is
-allowed to choose between plans — a cost model that cannot predict the naive case has
+allowed to choose between plans, a cost model that cannot predict the naive case has
 no business ranking alternatives.
 
 ---
@@ -616,7 +616,7 @@ cost-based kernel scheduling. Where the analogy to databases strains: SQL
 optimization is dominated by *cardinality estimation* (guessing how many rows a
 filter passes), which is data-dependent and statistical. Tensor programs are mostly
 statically shaped and dense, so the hard part moves from "estimate selectivity" to
-"model the device accurately." That shift is the point, not a flaw — it is why the
+"model the device accurately." That shift is the point, not a flaw, it is why the
 cost model, not the search, carries the intelligence.
 
 The defensible, novel core is three things, none of which those systems center:
@@ -659,43 +659,43 @@ To resume work across sessions:
 4. `python scripts/assess.py --start`, then `cargo test --workspace` to confirm green.
 5. Do the first action listed in that checkpoint.
 
-The full development process — the self-assessment loop, commit and checkpoint
-discipline, context-budget rules, and how to set this workflow up in a new project —
+The full development process, the self-assessment loop, commit and checkpoint
+discipline, context-budget rules, and how to set this workflow up in a new project
 lives in `WORKFLOW.md`.
 
 ---
 
 ## 13. Glossary
 
-- **Tensor** — a multi-dimensional array of numbers. A matrix is a 2-D tensor.
-- **Shape suffix** — the convention of writing a tensor's shape into its name:
+- **Tensor**, a multi-dimensional array of numbers. A matrix is a 2-D tensor.
+- **Shape suffix**, the convention of writing a tensor's shape into its name:
   `Q_sd` is `[seq, dim]`.
-- **FLOPs** — floating-point operations; the amount of arithmetic.
-- **HBM** — High Bandwidth Memory; the GPU's large, relatively slow memory.
-- **SRAM** — the GPU's small, very fast on-chip memory.
-- **Arithmetic intensity** — FLOPs per byte moved; where a program sits on the
+- **FLOPs**, floating-point operations; the amount of arithmetic.
+- **HBM**, High Bandwidth Memory; the GPU's large, relatively slow memory.
+- **SRAM**, the GPU's small, very fast on-chip memory.
+- **Arithmetic intensity**, FLOPs per byte moved; where a program sits on the
   roofline.
-- **Roofline** — a model plotting achievable performance against arithmetic
+- **Roofline**, a model plotting achievable performance against arithmetic
   intensity, with a memory-bound region and a compute-bound region.
-- **Ridge point** — the intensity where memory-bound meets compute-bound
+- **Ridge point**, the intensity where memory-bound meets compute-bound
   (peak_flops / peak_bandwidth).
-- **Binding resource** — the constraint that produces the maximum (slowest) time;
+- **Binding resource**, the constraint that produces the maximum (slowest) time;
   the thing actually limiting the program.
-- **e-graph** — a data structure that compactly stores many equivalent programs,
+- **e-graph**, a data structure that compactly stores many equivalent programs,
   grouped into e-classes of proven-equal expressions.
-- **Equality saturation** — applying rewrite rules to an e-graph until no rule adds
+- **Equality saturation**, applying rewrite rules to an e-graph until no rule adds
   anything new.
-- **Extraction** — choosing one concrete program out of a saturated e-graph by
+- **Extraction**, choosing one concrete program out of a saturated e-graph by
   minimizing a cost function.
-- **DAG-aware extraction** — extraction that counts shared subexpressions once
+- **DAG-aware extraction**, extraction that counts shared subexpressions once
   rather than double-counting them (tree cost).
-- **Fusion** — running several operations as one kernel so intermediates stay in
+- **Fusion**, running several operations as one kernel so intermediates stay in
   SRAM and never spill to HBM.
-- **Flash Attention** — an attention kernel that avoids materializing the
+- **Flash Attention**, an attention kernel that avoids materializing the
   `seq×seq` score matrix by tiling; the human-found version of what this optimizer
   aims to find automatically.
-- **Constraint** — one physical resource's lower bound on time, in the cost model.
-- **Preregistration** — committing a benchmark's config, metric, and success
+- **Constraint**, one physical resource's lower bound on time, in the cost model.
+- **Preregistration**, committing a benchmark's config, metric, and success
   threshold *before* running it, so results cannot be retrofitted.
 
 ---

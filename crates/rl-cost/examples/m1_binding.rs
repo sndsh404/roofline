@@ -5,7 +5,7 @@ fn main() {
         .add(FlopsConstraint::new(A100))
         .add(HbmConstraint::new(A100));
 
-    println!("\nM1: Roofline analysis — naive attention on A100");
+    println!("\nM1: Roofline analysis, naive attention on A100");
     println!("A100 ridge point: {:.1} flop/byte", A100.ridge_point());
     println!("{}", "─".repeat(90));
     println!("{:<20}  {:<14} {:<14} {:<8} {:<10}  {}", 

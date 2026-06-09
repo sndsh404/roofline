@@ -123,7 +123,7 @@ pub fn infer_shape(
 // M0 model: every intermediate is materialised to HBM.
 // hbm_bytes = sum over all nodes of (output tensor bytes written).
 // Inputs (Var) count as read from HBM.
-// This is the "naive everywhere" lower bound — M1 will calibrate against wall-clock.
+// This is the "naive everywhere" lower bound, M1 will calibrate against wall-clock.
 
 #[derive(Clone, Debug, Default)]
 pub struct Account {
@@ -215,7 +215,7 @@ fn account_node(
 
 /// Walk a fused subtree: accumulate total flops and distinct leaf input sizes,
 /// returning the subtree's output shape. Internal intermediate tensors are not
-/// recorded as HBM traffic — that is the whole point of fusion.
+/// recorded as HBM traffic, that is the whole point of fusion.
 fn fused_walk(
     expr: &RecExpr<TensorLang>,
     root: Id,

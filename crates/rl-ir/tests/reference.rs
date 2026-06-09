@@ -108,7 +108,7 @@ fn hbm_contains_s_squared_term() {
         ]);
         let (expr, root) = naive_attention_program();
         let acc = account(&expr, root, &shapes);
-        // scores_ss is [s,s] f32 — the O(s²) tensor that Flash avoids writing.
+        // scores_ss is [s,s] f32, the O(s²) tensor that Flash avoids writing.
         let scores_bytes = (s * s * 4) as u64;
         assert!(
             acc.hbm_bytes >= scores_bytes,

@@ -47,7 +47,7 @@ fn scale_distrib<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
 fn fusion<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
     // General producer/consumer fusion: a softmax consumed immediately by a matmul
     // can run as one kernel, so its s×s output need not spill to HBM. This is NOT
-    // a canned "attention => flash" rule (CLAUDE.md rule 4) — it is the general
+    // a canned "attention => flash" rule (CLAUDE.md rule 4), it is the general
     // "a producer consumed at once need not spill" identity, which happens to fire
     // on attention. Applied to the naive root it makes the fused form reachable in
     // the same e-class; the cost model decides whether to take it.
@@ -78,7 +78,7 @@ pub fn saturate(expr: &RecExpr<TensorLang>) -> Runner<TensorLang, ()> {
 // ── Cost-driven extraction over a shaped e-graph ─────────────────────────────
 //
 // This is a custom extractor, NOT egg's tree `Extractor` (which double-counts
-// shared tensors — the Tensat wall, CLAUDE.md rule 6). It is a greedy bottom-up
+// shared tensors, the Tensat wall, CLAUDE.md rule 6). It is a greedy bottom-up
 // selection driven by the `rl-cost` `CostModel`, reading per-e-class shapes from
 // `ShapeAnalysis` to compute real flops and bytes. The `fuse` node is costed by
 // its subtree's fused account (internal intermediates not charged to HBM), so a
@@ -129,7 +129,7 @@ fn node_flops(egraph: &EGraph<TensorLang, ShapeAnalysis>, enode: &TensorLang) ->
 /// Stage 2 is where the A/B lives: a FLOPs-only model sees no benefit to fusion
 /// (same flops, one extra node) and keeps the materialized plan; adding HbmBytes
 /// makes the fused plan cheaper. Selection is greedy (exact min-cost DAG
-/// extraction is NP-hard — `LpExtractor`/ILP territory), but every cost is real
+/// extraction is NP-hard, `LpExtractor`/ILP territory), but every cost is real
 /// bytes from the shape analysis and the fuse decision uses the fuse-aware
 /// accountant directly.
 pub fn extract_cost_driven(
@@ -261,7 +261,7 @@ pub fn account_expr(
 // existence check). Selection between the reachable forms is the cost model's
 // job: account each candidate, then ask the `CostModel` for its time under the
 // active constraint set, and take the cheapest. The whole thesis is that the
-// winner flips when you add the HBM constraint — same candidates, same e-graph,
+// winner flips when you add the HBM constraint, same candidates, same e-graph,
 // one extra constraint. Ties (e.g. equal FLOPs under a FLOPs-only model) break
 // toward the simpler plan (fewer nodes), so a model that cannot see HBM has no
 // reason to fuse.

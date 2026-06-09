@@ -27,21 +27,21 @@ checkpoints for state, an objective scoring script for assessment, and hard gate
 
 ## 2. The four documents
 
-- **`CLAUDE.md`** — the per-session operating guide. Loaded automatically every
+- **`CLAUDE.md`**, the per-session operating guide. Loaded automatically every
   session. Holds the prime directive, hard rules, repo map, build commands, and
   the milestone checklist. Keep it tight; it is read every time.
-- **`README.md`** — the living single source of truth. What the project is, the
+- **`README.md`**, the living single source of truth. What the project is, the
   architecture, current status, how to resume, decisions and lessons. Updated in
   the same commit as the change it describes.
-- **`DESIGN.md`** — the full spec. The deep technical content and milestone
+- **`DESIGN.md`**, the full spec. The deep technical content and milestone
   done-criteria. Changes rarely.
-- **`WORKFLOW.md`** — this file. How the work is done, independent of what is
+- **`WORKFLOW.md`**, this file. How the work is done, independent of what is
   being built.
 
 Plus two living folders:
 
-- **`quality_reports/checkpoints/`** — one file per stopping point.
-- **`.claude/state/`** — machine state for the assessment script (gitignored).
+- **`quality_reports/checkpoints/`**, one file per stopping point.
+- **`.claude/state/`**, machine state for the assessment script (gitignored).
 
 ---
 

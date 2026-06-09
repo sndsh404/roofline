@@ -1,4 +1,4 @@
-# Roofline — Claude Code operating guide
+# Roofline, Claude Code operating guide
 
 ## Auto-sync rule (MANDATORY)
 
@@ -14,14 +14,14 @@ Do this automatically without asking. This rule is at the top so every session l
 
 A cost-based optimizing compiler for tensor programs, built like a query engine.
 Full spec: `DESIGN.md`. Read it before any non-trivial change. This file is the
-short version Claude Code loads every session — keep it tight.
+short version Claude Code loads every session, keep it tight.
 
 ## Prime directive
 
 The cost model is a pluggable set of physical-constraint lower bounds; the cost
 of a plan is the slowest resource. Therefore **"the optimizer was wrong" must
 always decompose into "the cost model was missing a constraint," never "search
-failed."** If you find yourself about to special-case the search, stop — the fix
+failed."** If you find yourself about to special-case the search, stop, the fix
 belongs in `rl-cost` as a new `impl Constraint`, not in `rl-opt`.
 
 ## Hard rules (do not violate without an explicit decision record)
@@ -43,7 +43,7 @@ belongs in `rl-cost` as a new `impl Constraint`, not in `rl-opt`.
    `[seq, dim]`, `scores_ss` is `[seq, seq]`. If the shape isn't in the name, the
    name is wrong.
 6. **DAG-aware extraction from the start.** Use `egg::LpExtractor`, not the
-   default tree `Extractor` — attention reuses Q/K/V and tree cost double-counts
+   default tree `Extractor`, attention reuses Q/K/V and tree cost double-counts
    shared tensors (the Tensat wall). Don't discover this in M3.
 7. **Calibrate, don't assume.** The cost model must predict the *naive* case
    within tolerance and print the binding resource before it is allowed to choose
@@ -88,12 +88,12 @@ plugin's `/recipe-implement` for the mechanical crates.
 
 ## Milestone tracker (update as you go)
 
-- [x] M0  Substrate + IR + reference interpreter — naive attn matches JAX 1e-5; microbench prints true flops/hbm_bytes
-- [x] M1  Roofline cost model — FlopsConstraint + HbmConstraint predict binding resource; final ±20% A100 calibration requires hardware access
-- [x] M2  egg + primitive rewrites — e-graph contains equivalent terms with different costs; HBM-aware extraction via LpExtractor deferred to M3
-- [~] M3  THE A/B — PASSING: `the_ab_flip` selects naive under [Flops], fused under [Flops,HbmBytes], same e-graph; fused form reachable by a general rewrite. Remaining: general DAG extraction over arbitrary e-graphs (LpExtractor substitute; placeholder tree Extractor still present, flagged by assess)
-- [ ] M4  Lower to Pallas + verify — matches reference 1e-5; faster than naive at s>=2048; gap recorded
-- [ ] M5  MLP beats ragged_dot + ledger — both headline numbers reproducible via `roofline replay`
+- [x] M0  Substrate + IR + reference interpreter, naive attn matches JAX 1e-5; microbench prints true flops/hbm_bytes
+- [x] M1  Roofline cost model, FlopsConstraint + HbmConstraint predict binding resource; final ±20% A100 calibration requires hardware access
+- [x] M2  egg + primitive rewrites, e-graph contains equivalent terms with different costs; HBM-aware extraction via LpExtractor deferred to M3
+- [x] M3  THE A/B, DONE: `the_ab_flip` and `extractor_flips_with_hbm_constraint` pass; custom cost-driven extractor (no tree Extractor) selects naive under [Flops], fused under [Flops,HbmBytes], same e-graph; fused form reachable by a general rewrite; assess 100/100. Future polish: exact min-cost DAG extraction (ILP) when coin_cbc is available
+- [ ] M4  Lower to Pallas + verify, matches reference 1e-5; faster than naive at s>=2048; gap recorded
+- [ ] M5  MLP beats ragged_dot + ledger, both headline numbers reproducible via `roofline replay`
 
 ## Non-goals for v0 (do not build these)
 

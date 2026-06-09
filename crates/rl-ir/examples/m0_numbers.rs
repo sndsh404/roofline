@@ -2,7 +2,7 @@ use rl_ir::{account, naive_attention_program};
 use std::collections::HashMap;
 
 fn main() {
-    println!("\nM0 ground-truth numbers — naive attention arithmetic intensity");
+    println!("\nM0 ground-truth numbers, naive attention arithmetic intensity");
     println!("{:<6} {:<6} {:>14} {:>14} {:>12}", "s", "d", "FLOPs", "HBM bytes", "flop/byte");
     println!("{}", "─".repeat(56));
 

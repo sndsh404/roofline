@@ -1,6 +1,6 @@
 //! The `fuse` primitive must do two things: change nothing about the value, and
 //! cut HBM by keeping the s×s intermediates out of HBM. These two tests are the
-//! contract the M3 A/B relies on — the optimizer may only prefer the fused form
+//! contract the M3 A/B relies on, the optimizer may only prefer the fused form
 //! because it is cheaper AND still correct.
 
 use std::collections::HashMap;

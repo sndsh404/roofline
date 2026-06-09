@@ -1,4 +1,4 @@
-# Roofline — Design spec
+# Roofline, Design spec
 
 A cost-based optimizing compiler for tensor programs, structured like a query
 engine. The optimizer's decisions are driven by a pluggable roofline cost model,
@@ -20,14 +20,14 @@ IR (egg RecExpr<TensorLang>)
   │  produces saturated e-graph
   ▼
 [rl-cost] CostModel[Constraint+] selects min-cost plan
-  │  (LpExtractor, not tree Extractor — rule 6)
+  │  (LpExtractor, not tree Extractor, rule 6)
   ▼
 [rl-codegen] physical plan → Pallas/Triton kernel
 ```
 
 ## 2. Tensor IR (rl-ir)
 
-The IR is an egg `RecExpr<TensorLang>` — a DAG of operators over named input
+The IR is an egg `RecExpr<TensorLang>`, a DAG of operators over named input
 tensors. Every intermediate has an inferred shape; every input carries a shape
 suffix in its name (`Q_sd`, `scores_ss`, etc.).
 
@@ -48,7 +48,7 @@ calibrates this against wall-clock.
 
 The cost model is a set of `Constraint` trait objects. Each constraint produces a
 lower bound on wall-clock time. The cost of a plan is the **maximum** across all
-constraints — the slowest resource.
+constraints, the slowest resource.
 
 ```
 trait Constraint {
@@ -68,7 +68,7 @@ Adding a new device means adding a device-specific set of these constants, not
 changing the search.
 
 **Prime directive:** If the optimizer makes a wrong choice, the fix is always a
-new or corrected constraint — never a search heuristic.
+new or corrected constraint, never a search heuristic.
 
 ## 4. Preregistration & ledger (rl-ledger)
 
@@ -123,7 +123,7 @@ For each block (Qi, Kj, Vj):
   attn_i    = OnlineSoftmax(scores_ij, Vj)    // online softmax update
 ```
 The online softmax update computes the block contribution and rescales the
-running output. This identity requires no new IR nodes — the tiled form is
+running output. This identity requires no new IR nodes, the tiled form is
 expressible as a DAG of MatMul, EMul, and Softmax nodes over slices.
 
 ### 5.6 Ragged MLP decomposition
@@ -182,32 +182,32 @@ Single-letter dimensions: `s` = sequence, `d` = head dim, `f` = features,
 Every milestone ends in a **number**, not a refactor. The number is compared
 against the preregistered claim.
 
-### M0 — Substrate + IR + reference interpreter
+### M0, Substrate + IR + reference interpreter
 **Done when:** reference interpreter matches JAX fixture to `1e-5` for naive
 attention (s=4, d=8) and the `m0_numbers` example prints ground-truth FLOPs and
 HBM bytes for s=64..1024, d=64.
 
-### M1 — Roofline cost model calibrated
+### M1, Roofline cost model calibrated
 **Done when:** cost model predicts naive attention wall-clock time within ±20%
 of measured microbench for s∈{256,512,1024}, d=64 on an A100, and `println!`s
 the name of the binding resource ("HbmBytes" for all s in that range).
 
-### M2 — egg + primitive rewrites
+### M2, egg + primitive rewrites
 **Done when:** After saturating with the §5 rewrite rules, the e-graph for
 naive attention (s=1024, d=64) contains a term equivalent to the tiled Flash
 form. Verified by extracting a term whose account shows `hbm_bytes < s²·4`.
 
-### M3 — LpExtractor + the A/B
+### M3, LpExtractor + the A/B
 **Done when:** With `[Flops]` as the only constraint, `LpExtractor` returns the
 naive plan. With `[Flops, HbmBytes]`, the same e-graph returns the Flash plan.
 Both extracted plans pass the numerics gate. Record the runtime gap.
 
-### M4 — Lower to Pallas + verify
+### M4, Lower to Pallas + verify
 **Done when:** Lowered kernel matches reference interpreter to `1e-5` across
 s∈{128,256,512,1024,2048}, d=64. Kernel is faster than naive at s≥2048. Gap
 between measured and cost-model-predicted speed is recorded in ledger.
 
-### M5 — MLP beats ragged_dot + ledger
+### M5, MLP beats ragged_dot + ledger
 **Done when:** For F > D, the Roofline-optimised MLP kernel beats
 `jax.lax.ragged_dot` on an A100. Both the attention (M4) and MLP (M5) headline
 numbers are reproducible via `roofline replay`.

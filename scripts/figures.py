@@ -115,7 +115,7 @@ def ab_flip():
     ax.text(5.0, 1.35, "add the constraint you were ignoring", color=GREY,
             fontsize=8.5, ha="center")
 
-    ax.set_title("same search, same e-graph — one constraint flips the winner", color=INK)
+    ax.set_title("same search, same e-graph, one constraint flips the winner", color=INK)
     fig.tight_layout()
     fig.savefig(OUT / "ab_flip.png", bbox_inches="tight")
     plt.close(fig)
@@ -190,7 +190,7 @@ def fusion():
     _arrow(axf, (1.4, 3.4), (1.4, 0.95), color=GREEN, lw=1.2)   # only input read
     _arrow(axf, (8.5, 3.4), (8.5, 0.95), color=GREEN, lw=1.2)   # only output write
 
-    fig.suptitle("same math, two schedules — the fused plan skips the s×s round-trip",
+    fig.suptitle("same math, two schedules, the fused plan skips the s×s round-trip",
                  color=INK, fontsize=10)
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(OUT / "fusion.png", bbox_inches="tight")

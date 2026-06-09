@@ -9,7 +9,7 @@ it may never claim progress this script did not verify.
 
 Severity-weighted, 0-100, ported from claude-code-my-workflow/scripts/
 quality_score.py. Gates: 80 (commit), 90 (PR), 95 (excellence). A compile or
-test failure is an auto-fail (score 0) — a fast wrong kernel is worth nothing.
+test failure is an auto-fail (score 0), a fast wrong kernel is worth nothing.
 
 What it checks:
   P0 (auto-fail)  cargo build + cargo test --workspace must pass.
@@ -169,7 +169,7 @@ class Assessment:
             return
         text = claude.read_text(encoding="utf-8", errors="ignore")
         # M0 claims done but the captured numerics number actually fails the gate.
-        # Only fires when the number WAS captured — a missing number is "unverified",
+        # Only fires when the number WAS captured, a missing number is "unverified",
         # not a failure.
         err = self.numbers.get("m0_numerics_err")
         if "[x] M0" in text and err is not None and err > 1e-5:
@@ -192,8 +192,8 @@ class Assessment:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        lines = [f"# Roofline assessment — {now}", "",
-                 f"**Score: {self.score}/100 — {self.status()}**  "
+        lines = [f"# Roofline assessment, {now}", "",
+                 f"**Score: {self.score}/100, {self.status()}**  "
                  f"(gates: commit 80, pr 90, excellence 95)", ""]
         if self.numbers:
             lines.append("## Numbers")
@@ -203,12 +203,12 @@ class Assessment:
         for sev, label in [("P0", "Auto-fail"), ("P1", "Regressions / rule violations"),
                            ("P2", "Tracker / coverage"), ("P3", "Hygiene")]:
             if self.issues[sev]:
-                lines.append(f"## {sev} — {label}")
+                lines.append(f"## {sev}, {label}")
                 for it in self.issues[sev]:
                     lines.append(f"- (-{it['points']}) {it['msg']}")
                 lines.append("")
         if self.unverified:
-            lines.append("## Unverified (could not run — not counted against score)")
+            lines.append("## Unverified (could not run, not counted against score)")
             lines += [f"- {u}" for u in self.unverified] + [""]
         if not any(self.issues.values()):
             lines.append("No issues found. Score reflects a clean build + green tests.\n")
@@ -231,7 +231,7 @@ def load_prev():
 
 def cmd_start():
     prev = load_prev()
-    print("# Roofline — session start\n")
+    print("# Roofline, session start\n")
     if prev:
         print(f"Last assessment: {prev['score']}/100 ({prev['status']}) at {prev['ts']}")
         if prev.get("numbers"):
