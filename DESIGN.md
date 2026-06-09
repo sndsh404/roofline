@@ -103,13 +103,14 @@ MatMul(Transpose(A), B)  ←→  MatMul(A, Transpose(B))
 MatMul(EMul(A, s), B)  ←→  EMul(MatMul(A, B), s)    // s is scalar [1]
 ```
 
-### 5.4 Softmax of scaled input
+### 5.4 Scalar scaling distribution through MatMul
 ```
-Softmax(EMul(A, s))  ←→  Softmax(A)    // softmax is scale-invariant along rows
+MatMul(EMul(A, s), B)  ←→  EMul(MatMul(A, B), s)    // s is scalar [1]
+EMul(MatMul(A, B), s)  ←→  MatMul(A, EMul(B, s))    // s is scalar [1]
 ```
-Note: this is an equivalence because softmax normalises by row sum, cancelling
-a uniform row-wise scale. The numerical path still applies s before softmax (for
-stability), but the algebraic identity holds.
+Scalar multiplication distributes over matrix multiplication. This lets the
+1/sqrt(d) scale in attention move through the QK^T matmul, producing
+equivalent programs with different intermediate tensor shapes being scaled.
 
 ### 5.5 Online softmax tiling (the Flash identity)
 ```
