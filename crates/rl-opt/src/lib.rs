@@ -44,11 +44,23 @@ fn scale_distrib<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
     ]
 }
 
+fn fusion<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
+    // General producer/consumer fusion: a softmax consumed immediately by a matmul
+    // can run as one kernel, so its s×s output need not spill to HBM. This is NOT
+    // a canned "attention => flash" rule (CLAUDE.md rule 4) — it is the general
+    // "a producer consumed at once need not spill" identity, which happens to fire
+    // on attention. Applied to the naive root it makes the fused form reachable in
+    // the same e-class; the cost model decides whether to take it.
+    vec![rw!("fuse-softmax-matmul";
+        "(matmul (softmax ?x) ?v)" => "(fuse (matmul (softmax ?x) ?v))")]
+}
+
 pub fn all_rewrites<N: Analysis<TensorLang>>() -> Vec<Rewrite<TensorLang, N>> {
     let mut rules = vec![];
     rules.extend(matmul_assoc::<N>());
     rules.extend(transpose_matmul::<N>());
     rules.extend(scale_distrib::<N>());
+    rules.extend(fusion::<N>());
     rules
 }
 
@@ -131,6 +143,57 @@ pub fn account_expr(
 ) -> rl_ir::Account {
     let root = Id::from(expr.as_ref().len() - 1);
     rl_ir::account(expr, root, shapes)
+}
+
+// ── Cost-driven plan selection (the M3 A/B) ──────────────────────────────────
+//
+// The fusion rule makes the fused form *reachable* in the e-graph (proven by an
+// existence check). Selection between the reachable forms is the cost model's
+// job: account each candidate, then ask the `CostModel` for its time under the
+// active constraint set, and take the cheapest. The whole thesis is that the
+// winner flips when you add the HBM constraint — same candidates, same e-graph,
+// one extra constraint. Ties (e.g. equal FLOPs under a FLOPs-only model) break
+// toward the simpler plan (fewer nodes), so a model that cannot see HBM has no
+// reason to fuse.
+
+use rl_cost::CostModel;
+
+/// Index of the cheapest candidate under `model`. `shapes` gives input shapes.
+/// On a near-tie (within 0.1%), prefers the candidate with fewer nodes.
+pub fn select_plan(
+    candidates: &[RecExpr<TensorLang>],
+    shapes: &HashMap<String, Vec<usize>>,
+    model: &CostModel,
+) -> usize {
+    let mut best = 0usize;
+    let mut best_t = f64::INFINITY;
+    let mut best_nodes = usize::MAX;
+    for (i, expr) in candidates.iter().enumerate() {
+        let acc = account_expr(expr, shapes);
+        let (t, _binding, _) = model.cost(acc.flops, acc.hbm_bytes);
+        let nodes = expr.as_ref().len();
+        let tie = (t - best_t).abs() <= best_t * 1e-3;
+        if t < best_t - best_t * 1e-3 || (tie && nodes < best_nodes) {
+            best = i;
+            best_t = t;
+            best_nodes = nodes;
+        }
+    }
+    best
+}
+
+/// True if the fused form is reachable from `naive` after saturation, i.e. the
+/// fusion rule put it into the e-graph in the same e-class as the naive root.
+pub fn fused_form_reachable(
+    naive: &RecExpr<TensorLang>,
+    fused: &RecExpr<TensorLang>,
+    inputs: HashMap<String, Vec<usize>>,
+) -> bool {
+    let runner = saturate_shaped(naive, inputs);
+    match (runner.egraph.lookup_expr(naive), runner.egraph.lookup_expr(fused)) {
+        (Some(n), Some(f)) => runner.egraph.find(n) == runner.egraph.find(f),
+        _ => false,
+    }
 }
 
 // ── Shape analysis (M3 prerequisite) ─────────────────────────────────────────
@@ -274,6 +337,46 @@ mod tests {
             "FLOPs diff {} too large between equivalent programs (naive={}, best={})",
             diff, naive_acc.flops, best_acc.flops
         );
+    }
+
+    #[test]
+    fn fused_form_is_reachable_by_rewrite() {
+        // The fusion rule must put the fused form into the naive program's e-class
+        // (reachable, not hand-built). This is the rule-4-honest half: fusion comes
+        // from a general rewrite.
+        use rl_ir::{fused_attention_program, naive_attention_program};
+        let (naive, _) = naive_attention_program();
+        let (fused, _) = fused_attention_program();
+        assert!(
+            fused_form_reachable(&naive, &fused, attn_shapes(64, 32)),
+            "fusion rewrite should make the fused form reachable in the e-graph"
+        );
+    }
+
+    #[test]
+    fn the_ab_flip() {
+        // THE result the repo exists for. Same two candidate plans, both reachable
+        // in the same e-graph. With only FLOPs modelled the cost model cannot see
+        // the s×s HBM round-trip, so it keeps the simpler naive plan. Add the HBM
+        // constraint and the fused plan wins. Same search, one extra constraint.
+        use rl_cost::{CostModel, FlopsConstraint, HbmConstraint, H100};
+        use rl_ir::{fused_attention_program, naive_attention_program};
+
+        let (naive, _) = naive_attention_program();
+        let (fused, _) = fused_attention_program();
+        let candidates = [naive, fused]; // index 0 = naive, 1 = fused
+        let shapes = attn_shapes(2048, 64); // long sequence: HBM dominates
+
+        let flops_only = CostModel::new().add(FlopsConstraint::new(H100));
+        let with_hbm = CostModel::new()
+            .add(FlopsConstraint::new(H100))
+            .add(HbmConstraint::new(H100));
+
+        let pick_flops = select_plan(&candidates, &shapes, &flops_only);
+        let pick_hbm = select_plan(&candidates, &shapes, &with_hbm);
+
+        assert_eq!(pick_flops, 0, "with [Flops] only, the optimizer should keep naive");
+        assert_eq!(pick_hbm, 1, "with [Flops, HbmBytes], the optimizer should choose fused");
     }
 
     #[test]
