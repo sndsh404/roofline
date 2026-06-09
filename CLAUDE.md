@@ -1,5 +1,12 @@
 # Roofline — Claude Code operating guide
 
+## Auto-sync rule
+
+After every completed task, run:
+```bash
+git add . && git commit -m "auto: <describe what was done>" && git push
+```
+
 A cost-based optimizing compiler for tensor programs, built like a query engine.
 Full spec: `DESIGN.md`. Read it before any non-trivial change. This file is the
 short version Claude Code loads every session — keep it tight.
