@@ -16,6 +16,15 @@ define_language! {
         "emul" = EMul([Id; 2]),
         // Numerically stable softmax along the last axis.
         "softmax" = Softmax([Id; 1]),
+        // Fusion boundary: the wrapped subgraph runs as one kernel and its
+        // internal intermediates are NOT spilled to HBM. Value-identity (it does
+        // not change the math), so the interpreter treats it as a pass-through.
+        // The accountant charges HBM only for the boundary inputs and final
+        // output. This is the general "producer consumed immediately need not
+        // spill" primitive; applied to attention it removes the s×s round-trip.
+        // NB: it assumes the fused region fits SRAM. The SRAM-capacity constraint
+        // that forces tiling for large s is future work (a new impl Constraint).
+        "fuse" = Fuse([Id; 1]),
     }
 }
 
@@ -67,6 +76,8 @@ pub fn eval(
             emul_broadcast(&ta, &tb)
         }
         TensorLang::Softmax([a]) => softmax_last(&eval(expr, a, env)),
+        // Fusion is a scheduling annotation; it does not change the value.
+        TensorLang::Fuse([a]) => eval(expr, a, env),
     }
 }
 
@@ -103,6 +114,7 @@ pub fn infer_shape(
             }
         }
         TensorLang::Softmax([a]) => infer_shape(expr, a, shapes),
+        TensorLang::Fuse([a]) => infer_shape(expr, a, shapes),
     }
 }
 
@@ -183,6 +195,64 @@ fn account_node(
             acc.hbm_bytes += (prefix * last * 4) as u64;
             sa
         }
+        TensorLang::Fuse([a]) => {
+            // The fused region computes all the same flops, but only its boundary
+            // inputs (distinct leaves) and final output touch HBM. Internal
+            // intermediates stay in SRAM, so we do NOT recurse via account_node
+            // (which would charge every intermediate). This is the HBM saving the
+            // M3 A/B rewards.
+            let mut flops = 0u64;
+            let mut leaves: HashMap<String, usize> = HashMap::new();
+            let out_shape = fused_walk(expr, a, shapes, &mut flops, &mut leaves);
+            let leaf_bytes: u64 = leaves.values().map(|n| (*n * 4) as u64).sum();
+            let out_bytes = (out_shape.iter().product::<usize>() * 4) as u64;
+            acc.flops += flops;
+            acc.hbm_bytes += leaf_bytes + out_bytes;
+            out_shape
+        }
+    }
+}
+
+/// Walk a fused subtree: accumulate total flops and distinct leaf input sizes,
+/// returning the subtree's output shape. Internal intermediate tensors are not
+/// recorded as HBM traffic — that is the whole point of fusion.
+fn fused_walk(
+    expr: &RecExpr<TensorLang>,
+    root: Id,
+    shapes: &HashMap<String, Vec<usize>>,
+    flops: &mut u64,
+    leaves: &mut HashMap<String, usize>,
+) -> Vec<usize> {
+    match expr[root].clone() {
+        TensorLang::Var(sym) => {
+            let s = shapes[sym.as_str()].clone();
+            leaves.insert(sym.to_string(), s.iter().product());
+            s
+        }
+        TensorLang::MatMul([a, b]) => {
+            let sa = fused_walk(expr, a, shapes, flops, leaves);
+            let sb = fused_walk(expr, b, shapes, flops, leaves);
+            let (m, k, n) = (sa[0], sa[1], sb[1]);
+            *flops += 2 * m as u64 * k as u64 * n as u64;
+            vec![m, n]
+        }
+        TensorLang::Transpose([a]) => {
+            let sa = fused_walk(expr, a, shapes, flops, leaves);
+            vec![sa[1], sa[0]]
+        }
+        TensorLang::EMul([a, b]) => {
+            let sa = fused_walk(expr, a, shapes, flops, leaves);
+            let sb = fused_walk(expr, b, shapes, flops, leaves);
+            let out = if sa.iter().product::<usize>() == 1 { sb } else { sa };
+            *flops += out.iter().product::<usize>() as u64;
+            out
+        }
+        TensorLang::Softmax([a]) => {
+            let sa = fused_walk(expr, a, shapes, flops, leaves);
+            *flops += 4 * sa.iter().product::<usize>() as u64;
+            sa
+        }
+        TensorLang::Fuse([a]) => fused_walk(expr, a, shapes, flops, leaves),
     }
 }
 
@@ -202,6 +272,27 @@ pub fn naive_attention_program() -> (RecExpr<TensorLang>, Id) {
     let attn    = e.add(TensorLang::Softmax([scaled]));
     let out     = e.add(TensorLang::MatMul([attn, v]));   // [s,d]
     (e, out)
+}
+
+/// Attention with the whole score/softmax/output chain fused: the s×s scores and
+/// probabilities never spill to HBM. Same value as `naive_attention_program`
+/// (the interpreter treats `fuse` as identity), but a far smaller HBM bill. This
+/// is the form the M3 A/B selects once the HBM constraint is modelled. NB: it
+/// assumes the fused region fits SRAM; the capacity constraint that forces tiling
+/// for large s is the next `impl Constraint`.
+pub fn fused_attention_program() -> (RecExpr<TensorLang>, Id) {
+    let mut e = RecExpr::default();
+    let q  = e.add(TensorLang::Var("Q_sd".into()));
+    let k  = e.add(TensorLang::Var("K_sd".into()));
+    let v  = e.add(TensorLang::Var("V_sd".into()));
+    let sc = e.add(TensorLang::Var("scale".into()));
+    let kt     = e.add(TensorLang::Transpose([k]));
+    let scores = e.add(TensorLang::MatMul([q, kt]));
+    let scaled = e.add(TensorLang::EMul([scores, sc]));
+    let attn   = e.add(TensorLang::Softmax([scaled]));
+    let out    = e.add(TensorLang::MatMul([attn, v]));
+    let fused  = e.add(TensorLang::Fuse([out]));
+    (e, fused)
 }
 
 /// Two-layer MLP: down(up(x))  (no activation in M0)

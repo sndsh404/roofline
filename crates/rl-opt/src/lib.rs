@@ -182,6 +182,7 @@ impl Analysis<TensorLang> for ShapeAnalysis {
                 }
             }
             TensorLang::Softmax([a]) => child(a),
+            TensorLang::Fuse([a]) => child(a),
         }
     }
 
