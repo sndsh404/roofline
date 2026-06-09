@@ -89,7 +89,7 @@ Source of truth for the checklist is `CLAUDE.md`. Current state:
 | M0 Substrate + IR + reference interpreter | done | rl-ir 3 tests; interpreter matches fixture to 1e-5; `m0_numbers` prints true flops/hbm_bytes |
 | M1 Roofline cost model | done | rl-cost 4 tests; `m1_binding` prints binding resource per shape on A100/H100. Empirical wall-clock calibration (±20-30% vs measured) needs accelerator access and is deferred |
 | M2 egg + primitive rewrites | done | rl-opt 5 tests; rules for matmul assoc, transpose, scale distribution; e-graph holds equivalent terms with different HBM cost |
-| M3 LpExtractor + THE A/B | **next** | `[Flops]` returns naive; `[Flops, HbmBytes]` returns flash, same e-graph |
+| M3 LpExtractor + THE A/B | **in progress** | shape analysis done (e-graph knows every e-class shape); remaining: `fuse` primitive + cost-driven DAG extractor so `[Flops]` returns naive and `[Flops, HbmBytes]` returns the fused form |
 | M4 Lower to kernel + verify | not started | matches reference 1e-5; faster than naive at s>=2048; record predicted-vs-measured gap |
 | M5 MLP beats ragged_dot + ledger | not started | both headline numbers reproducible via `roofline replay` |
 
