@@ -1,0 +1,9 @@
+[package]
+name = "rl-opt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rl-ir   = { path = "../rl-ir" }
+rl-cost = { path = "../rl-cost" }
+egg = "0.9"
