@@ -1,0 +1,12 @@
+[package]
+name = "roofline-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "roofline"
+path = "src/main.rs"
+
+[dependencies]
+rl-ledger  = { path = "../rl-ledger" }
+rl-codegen = { path = "../rl-codegen" }

@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use egg::{Id, RecExpr};
 use rl_ir::{eval, TensorData, TensorLang};
 
+pub mod bench;
+
 /// Which kernel a plan lowers to. A plan that contains a `fuse` node lowers to
 /// the matching fused kernel; anything else falls back to the reference
 /// interpreter (correct, unoptimised).
