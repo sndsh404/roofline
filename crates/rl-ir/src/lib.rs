@@ -137,6 +137,13 @@ pub fn infer_shape(
 pub struct Account {
     pub flops: u64,
     pub hbm_bytes: u64,
+    /// Peak SRAM working set demanded by any fused region: its boundary
+    /// inputs, its final output, and every internal intermediate, all resident
+    /// at once. This is the monolithic no-tiling model the `fuse` node
+    /// assumes, measured instead of assumed, so an SRAM capacity constraint
+    /// can refuse fusions that cannot actually fit on chip. Zero for plans
+    /// with no fuse node.
+    pub sram_bytes: u64,
 }
 
 impl Account {
@@ -219,62 +226,74 @@ fn account_node(
             // M3 A/B rewards.
             let mut flops = 0u64;
             let mut leaves: HashMap<String, usize> = HashMap::new();
-            let out_shape = fused_walk(expr, a, shapes, &mut flops, &mut leaves);
+            let mut inter_bytes = 0u64;
+            let out_shape = fused_walk(expr, a, shapes, &mut flops, &mut leaves, &mut inter_bytes);
             let leaf_bytes: u64 = leaves.values().map(|n| (*n * 4) as u64).sum();
             let out_bytes = (out_shape.iter().product::<usize>() * 4) as u64;
             acc.flops += flops;
             acc.hbm_bytes += leaf_bytes + out_bytes;
+            // The fused region's working set: everything lives in SRAM at
+            // once under the monolithic model. The walk counted the region's
+            // own output among the intermediates, so subtract it back out.
+            let working_set = leaf_bytes + out_bytes + inter_bytes.saturating_sub(out_bytes);
+            acc.sram_bytes = acc.sram_bytes.max(working_set);
             out_shape
         }
     }
 }
 
-/// Walk a fused subtree: accumulate total flops and distinct leaf input sizes,
-/// returning the subtree's output shape. Internal intermediate tensors are not
-/// recorded as HBM traffic, that is the whole point of fusion.
+/// Walk a fused subtree: accumulate total flops, distinct leaf input sizes,
+/// and the bytes of every internal intermediate tensor, returning the
+/// subtree's output shape. Intermediates are not recorded as HBM traffic,
+/// that is the whole point of fusion, but they ARE recorded as SRAM demand,
+/// because under the monolithic no-tiling model they all live on chip at
+/// once.
 fn fused_walk(
     expr: &RecExpr<TensorLang>,
     root: Id,
     shapes: &HashMap<String, Vec<usize>>,
     flops: &mut u64,
     leaves: &mut HashMap<String, usize>,
+    inter_bytes: &mut u64,
 ) -> Vec<usize> {
-    match expr[root].clone() {
+    let out_shape = match expr[root].clone() {
         TensorLang::Var(sym) => {
             let s = shapes[sym.as_str()].clone();
             leaves.insert(sym.to_string(), s.iter().product());
-            s
+            return s; // a leaf is boundary input, not an intermediate
         }
         TensorLang::MatMul([a, b]) => {
-            let sa = fused_walk(expr, a, shapes, flops, leaves);
-            let sb = fused_walk(expr, b, shapes, flops, leaves);
+            let sa = fused_walk(expr, a, shapes, flops, leaves, inter_bytes);
+            let sb = fused_walk(expr, b, shapes, flops, leaves, inter_bytes);
             let (m, k, n) = (sa[0], sa[1], sb[1]);
             *flops += 2 * m as u64 * k as u64 * n as u64;
             vec![m, n]
         }
         TensorLang::Transpose([a]) => {
-            let sa = fused_walk(expr, a, shapes, flops, leaves);
+            let sa = fused_walk(expr, a, shapes, flops, leaves, inter_bytes);
             vec![sa[1], sa[0]]
         }
         TensorLang::EMul([a, b]) => {
-            let sa = fused_walk(expr, a, shapes, flops, leaves);
-            let sb = fused_walk(expr, b, shapes, flops, leaves);
+            let sa = fused_walk(expr, a, shapes, flops, leaves, inter_bytes);
+            let sb = fused_walk(expr, b, shapes, flops, leaves, inter_bytes);
             let out = if sa.iter().product::<usize>() == 1 { sb } else { sa };
             *flops += out.iter().product::<usize>() as u64;
             out
         }
         TensorLang::Softmax([a]) => {
-            let sa = fused_walk(expr, a, shapes, flops, leaves);
+            let sa = fused_walk(expr, a, shapes, flops, leaves, inter_bytes);
             *flops += 4 * sa.iter().product::<usize>() as u64;
             sa
         }
         TensorLang::Relu([a]) => {
-            let sa = fused_walk(expr, a, shapes, flops, leaves);
+            let sa = fused_walk(expr, a, shapes, flops, leaves, inter_bytes);
             *flops += sa.iter().product::<usize>() as u64;
             sa
         }
-        TensorLang::Fuse([a]) => fused_walk(expr, a, shapes, flops, leaves),
-    }
+        TensorLang::Fuse([a]) => return fused_walk(expr, a, shapes, flops, leaves, inter_bytes),
+    };
+    *inter_bytes += (out_shape.iter().product::<usize>() * 4) as u64;
+    out_shape
 }
 
 // ── Canonical programs ────────────────────────────────────────────────────────

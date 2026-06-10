@@ -87,6 +87,31 @@ fn fused_attention_cuts_hbm() {
     assert_eq!(na.flops, fa.flops, "fusion must not change flops");
 }
 
+#[test]
+fn fused_account_measures_sram_working_set() {
+    // The monolithic fuse model keeps boundary inputs, output, and every
+    // internal intermediate in SRAM at once. Hand-check at s=256, d=32:
+    //   leaves: Q,K,V at 256*32*4 each plus the 4-byte scale  =  98,308
+    //   output: 256*32*4                                      =  32,768
+    //   intermediates: Kt 32,768 + three s by s tensors
+    //     (scores, scaled, probs) at 262,144 each             = 819,200
+    let (s, d) = (256, 32);
+    let shapes = attn_shapes(s, d);
+
+    let (naive, naive_root) = naive_attention_program();
+    let (fused, fused_root) = fused_attention_program();
+
+    let na = account(&naive, naive_root, &shapes);
+    let fa = account(&fused, fused_root, &shapes);
+
+    assert_eq!(na.sram_bytes, 0, "an unfused plan demands no fused working set");
+    assert_eq!(
+        fa.sram_bytes,
+        98_308 + 32_768 + 819_200,
+        "fused working set must be leaves + output + intermediates"
+    );
+}
+
 // ── The same contract for the M5 MLP: relu(X_sd W_up_df) W_dn_fd ─────────────
 
 fn mlp_env(s: usize, d: usize, f: usize) -> HashMap<String, TensorData> {

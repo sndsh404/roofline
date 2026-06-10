@@ -162,8 +162,8 @@ pub fn extract_cost_driven(
     fused.add(TensorLang::Fuse([root_id]));
     let fused_acc = account_expr(&fused, &shapes);
 
-    let mat_t = model.cost(mat_acc.flops, mat_acc.hbm_bytes).0;
-    let fused_t = model.cost(fused_acc.flops, fused_acc.hbm_bytes).0;
+    let mat_t = model.cost(&Demand::from(&mat_acc)).0;
+    let fused_t = model.cost(&Demand::from(&fused_acc)).0;
     // strictly cheaper (beyond float noise) to justify the extra fuse node.
     if fused_t < mat_t - mat_t.abs() * 1e-9 {
         fused
@@ -209,7 +209,8 @@ fn select_class(
     }
     visiting.insert(id);
 
-    let time = |flops: u64, bytes: u64| model.cost(flops, bytes).0;
+    // per-node costing: no fused region here, so no SRAM demand
+    let time = |flops: u64, bytes: u64| model.cost(&Demand::new(flops, bytes)).0;
     let mut best = (f64::INFINITY, usize::MAX, 0usize);
     for (ni, enode) in egraph[id].nodes.iter().enumerate() {
         // Fuse nodes are skipped here: fusion is a value-identity wrapper decided
@@ -274,7 +275,7 @@ pub fn account_expr(
 // toward the simpler plan (fewer nodes), so a model that cannot see HBM has no
 // reason to fuse.
 
-use rl_cost::CostModel;
+use rl_cost::{CostModel, Demand};
 
 /// Index of the cheapest candidate under `model`. `shapes` gives input shapes.
 /// On a near-tie (within 0.1%), prefers the candidate with fewer nodes.
@@ -288,7 +289,7 @@ pub fn select_plan(
     let mut best_nodes = usize::MAX;
     for (i, expr) in candidates.iter().enumerate() {
         let acc = account_expr(expr, shapes);
-        let (t, _binding, _) = model.cost(acc.flops, acc.hbm_bytes);
+        let (t, _binding, _) = model.cost(&Demand::from(&acc));
         let nodes = expr.as_ref().len();
         let tie = (t - best_t).abs() <= best_t * 1e-3;
         if t < best_t - best_t * 1e-3 || (tie && nodes < best_nodes) {
@@ -463,6 +464,38 @@ mod tests {
         let h_flops = account_expr(&plan_flops, &shapes).hbm_bytes;
         let h_hbm = account_expr(&plan_hbm, &shapes).hbm_bytes;
         assert!(h_hbm < h_flops, "fused plan {h_hbm} should move fewer bytes than {h_flops}");
+    }
+
+    #[test]
+    fn sram_constraint_blocks_fusion_that_cannot_fit() {
+        // The documented fuse-model gap, closed the project's way: a new
+        // constraint, not a search hack. At s=2048 d=64 the monolithic fused
+        // working set is about 53 MB, over the A100's 20 MB of SRAM, so with
+        // the SramConstraint active the extractor must refuse to fuse. At
+        // s=256 d=32 the working set is under 1 MB and fusion stays the
+        // winner. Same model, same search, the constraint decides.
+        use rl_cost::{CostModel, FlopsConstraint, HbmConstraint, SramConstraint, A100};
+        let (expr, _) = naive_attention_program();
+        let with_sram = CostModel::new()
+            .add(FlopsConstraint::new(A100))
+            .add(HbmConstraint::new(A100))
+            .add(SramConstraint::new(A100));
+
+        let runner = saturate_shaped(&expr, attn_shapes(2048, 64));
+        let root = runner.egraph.lookup_expr(&expr).expect("root in egraph");
+        let plan = extract_cost_driven(&runner.egraph, root, &with_sram);
+        assert!(
+            !contains_fuse(&plan),
+            "fusion must be refused when its working set cannot fit in SRAM"
+        );
+
+        let runner = saturate_shaped(&expr, attn_shapes(256, 32));
+        let root = runner.egraph.lookup_expr(&expr).expect("root in egraph");
+        let plan = extract_cost_driven(&runner.egraph, root, &with_sram);
+        assert!(
+            contains_fuse(&plan),
+            "fusion should still win when the working set fits"
+        );
     }
 
     #[test]

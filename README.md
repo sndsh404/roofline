@@ -326,10 +326,11 @@ payoff: run `cargo run -p rl-cost --example m1_binding` and it prints
 `binding=HbmBytes` for attention across a sweep of shapes, which is the
 machine telling you what Tri Dao knew.
 
-Adding a constraint never touches the existing ones. SRAM capacity, occupancy,
-communication for multi-chip, each is a new twenty-line struct and a field on
-the device. That is what makes "the model was missing a constraint" a small
-fix instead of a redesign.
+Adding a constraint never touches the existing ones. SRAM capacity became the
+third constraint in exactly this way, a new twenty-line struct and one field
+on the device (section 10 tells that story). Occupancy and communication for
+multi-chip will be more of the same. That is what makes "the model was
+missing a constraint" a small fix instead of a redesign.
 
 ---
 
@@ -424,13 +425,23 @@ scores. Two tests pin the contract for each program: fused output equals naive
 output to 1e-5, and fused bytes are smaller by at least one full tile of the
 big intermediate while flops stay exactly equal.
 
-The caveat, stated loudly because it is the next piece of real work: treating
-the whole fused region as free of memory traffic assumes the working set fits
-in SRAM. Real Flash Attention tiles precisely because it does not fit. The
-missing piece is an SRAM capacity constraint that forces tiling at large
-sizes, and the satisfying part is that this gap is itself an instance of the
-project's one rule. The model is missing a constraint. The fix is twenty
-lines in `rl-cost`, not a rewrite of anything.
+For a while this model had a loudly documented gap: treating the fused region
+as free of memory traffic assumes its working set fits in SRAM, and real
+Flash Attention tiles precisely because it does not fit. That gap is now
+closed the project's own way, with a constraint rather than a search hack.
+The accountant measures each fused region's working set (boundary inputs,
+output, and every internal intermediate, all resident at once under the
+no-tiling model), the device carries its real on-chip SRAM size (about 20 MB
+on an A100), and `SramConstraint` returns an infinite time floor for any plan
+whose fused region cannot fit. The binding resource then reads `SramBytes`,
+the model saying plainly "this plan cannot run as scheduled". A test pins the
+behavior: at s=2048 the fused attention working set is about 53 MB, so the
+extractor with the SRAM constraint active refuses to fuse; at s=256 it fits
+and fusion still wins. One honest nuance remains: the streaming kernels in
+rl-codegen show that tiling rescues exactly these fusions, but the IR cannot
+express a tiled schedule yet, so the constraint is conservative on purpose.
+Teaching the IR tiling, so the model can price the tiled form instead of
+refusing the monolithic one, is the next real piece of work.
 
 ---
 
@@ -559,9 +570,10 @@ fused forms be reached by general algebra and selected by cost, never
 pattern-matched in.
 
 Current real limitations, all tracked, none hidden: no GPU numbers anywhere
-yet, the extractor is greedy rather than exact, the fuse model ignores SRAM
-capacity, and the cost model's wall-clock predictions are uncalibrated until
-there is an accelerator to calibrate against.
+yet, the extractor is greedy rather than exact, the IR cannot express tiled
+schedules (so the SRAM constraint refuses big fusions instead of pricing
+their tiled forms), and the cost model's wall-clock predictions are
+uncalibrated until there is an accelerator to calibrate against.
 
 ---
 
@@ -619,15 +631,15 @@ To resume work in a fresh session:
 
 ## 17. what comes next
 
-All six milestones are done in their CPU-honest form, so what remains is the
-deferred and the next layer. In rough order: an SRAM capacity constraint that
-forces tiling at sizes where the fused region cannot fit, which is the
-project's own rule applied to its own known gap; real GPU kernel emission
-(Pallas or Triton) once hardware is available, plus the A100 runs that M1, M4,
-and M5 each have on hold; calibration of predicted against measured time on
-that hardware; exact ILP extraction when a solver is available; and further
-out, a rewrite proposer that suggests new algebraic identities and only admits
-them after they pass the same numerics and benchmark gates as everything else.
+All six milestones are done in their CPU-honest form, and the SRAM capacity
+constraint (the first post-v0 item) is in as well. What remains, in rough
+order: tiling in the IR, so the model can price a tiled fusion instead of
+refusing the monolithic one; real GPU kernel emission (Pallas or Triton) once
+hardware is available, plus the A100 runs that M1, M4, and M5 each have on
+hold; calibration of predicted against measured time on that hardware; exact
+ILP extraction when a solver is available; and further out, a rewrite
+proposer that suggests new algebraic identities and only admits them after
+they pass the same numerics and benchmark gates as everything else.
 
 This file grows with the project. When a milestone lands, its row in the table
 gets the number that earned it.
